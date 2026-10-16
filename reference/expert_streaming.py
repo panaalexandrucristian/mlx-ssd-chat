@@ -1,0 +1,717 @@
+"""Expert streaming: GPU lookup table + pre-stacked weight tensors.
+
+Local exact Qwen3-MoE mode: enable_expert_streaming(..., exact=True,
+read_mode="pread"). Loads ALL routed experts before computation, using bounded
+disk reads and a temporary one-layer working set during prefill. This mode
+preserves routing semantics; the legacy approximate mode below is unchanged.
+
+Replaces MLX's QuantizedSwitchLinear with a cached version that:
+1. Keeps only `capacity` experts per layer in GPU memory (pre-stacked tensors)
+2. Uses a GPU lookup table to map global expert IDs to local cache slots
+3. Updates cache between tokens (not during forward pass)
+4. Zero-eval fallback: missing experts get score=0, remaining renormalized
+
+This is the technique that makes 50GB+ models run on 36GB Macs.
+
+Architecture:
+  Forward pass (GPU only, no CPU/disk):
+    router(x) -> expert_ids -> lookup[expert_ids] -> local_ids
+    gather_qmm(x, stacked_weights, local_ids) -> output
+
+  Between tokens (CPU + disk):
+    Record which experts were activated
+    Evict cold experts (LCP priority)
+    Load new experts from safetensors via mmap
+    Update stacked tensors + lookup table
+
+Usage:
+  from mlx_flash_compress.expert_streaming import enable_expert_streaming
+
+  model, tokenizer = mlx_lm.load("model_name", lazy=True)
+  streaming = enable_expert_streaming(model, capacity_per_layer=200)
+  streaming.warmup()
+
+  # Generate normally
+  output = mlx_lm.generate(model, tokenizer, prompt="Hello", max_tokens=100)
+  streaming.update()  # call between generation steps
+"""
+
+import json
+import math
+import mmap
+import os
+import struct
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import mlx.core as mx
+import mlx.nn as nn
+import numpy as np
+
+# -- Safetensors mmap reader --
+
+
+@dataclass
+class TensorInfo:
+    dtype: str
+    shape: list
+    data_offset: int
+    data_size: int
+
+
+class SafetensorsMap:
+    """Memory-mapped access to safetensors files for per-expert slicing."""
+
+    def __init__(self, shard_paths: list, read_mode="mmap"):
+        if read_mode not in ("mmap", "pread"):
+            raise ValueError("read_mode must be mmap or pread")
+        self.read_mode = read_mode
+        self._fds = {}
+        self._mmaps: dict[str, mmap.mmap] = {}
+        self._tensor_map: dict[str, tuple] = {}
+        self._data_offsets: dict[str, int] = {}
+        for path in shard_paths:
+            self._index_shard(path)
+
+    def _index_shard(self, path):
+        with open(path, "rb") as f:
+            header_size = struct.unpack("<Q", f.read(8))[0]
+            header_bytes = f.read(header_size)
+            data_start = 8 + header_size
+
+        header = json.loads(header_bytes)
+        self._data_offsets[path] = data_start
+
+        for key, info in header.items():
+            if key == "__metadata__":
+                continue
+            offsets = info.get("data_offsets", [0, 0])
+            self._tensor_map[key] = (
+                path,
+                TensorInfo(
+                    dtype=info.get("dtype", "F16"),
+                    shape=info.get("shape", []),
+                    data_offset=offsets[0],
+                    data_size=offsets[1] - offsets[0],
+                ),
+            )
+
+    def _get_mmap(self, path):
+        if path not in self._mmaps:
+            with open(path, "rb") as f:
+                self._mmaps[path] = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        return self._mmaps[path]
+
+    def _read(self, path, offset, size):
+        if self.read_mode == "mmap":
+            return self._get_mmap(path)[offset:offset + size]
+        if path not in self._fds:
+            self._fds[path] = os.open(path, os.O_RDONLY)
+        data = os.pread(self._fds[path], size, offset)
+        if len(data) != size:
+            raise OSError(f"Short safetensors read: {path}")
+        return data
+
+    _NP_DTYPES = {
+        "F16": np.float16,
+        "BF16": np.uint16,
+        "F32": np.float32,
+        "U32": np.uint32,
+        "I32": np.int32,
+        "U8": np.uint8,
+    }
+
+    def get_expert_slice(self, key, expert_ids):
+        """Load specific expert rows from stacked [E, ...] or per-expert format."""
+        # Try stacked format first (key = "...switch_mlp.gate_proj.weight" shape [E, ...])
+        if key in self._tensor_map:
+            path, info = self._tensor_map[key]
+            if len(info.shape) >= 3:
+                # Stacked format: slice rows directly
+                num_experts = info.shape[0]
+                row_size = info.data_size // num_experts
+                base = self._data_offsets[path] + info.data_offset
+                np_dtype = self._NP_DTYPES[info.dtype]
+                row_shape = info.shape[1:]
+
+                slices = []
+                for eid in expert_ids:
+                    if not 0 <= eid < num_experts:
+                        raise IndexError(f"Expert {eid} outside {key}")
+                    offset = base + eid * row_size
+                    raw = self._read(path, offset, row_size)
+                    arr = np.frombuffer(raw, dtype=np_dtype).reshape(row_shape)
+                    slices.append(arr)
+                res = mx.array(np.stack(slices))
+                return res.view(mx.bfloat16) if info.dtype == "BF16" else res
+
+        # Per-expert format: "model.layers.N.mlp.experts.E.proj.attr"
+        # Derive the per-expert key pattern from the stacked key
+        # e.g. "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        #    -> "model.layers.0.mlp.experts.{E}.gate_proj.weight"
+        per_expert_key = key.replace(".switch_mlp.", ".experts.0.")
+
+        # Mixtral: block_sparse_moe.experts.E.w1/w2/w3 naming
+        _MIXTRAL_MAP = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+        if per_expert_key not in self._tensor_map:
+            for mlx_name, st_name in _MIXTRAL_MAP.items():
+                per_expert_key = per_expert_key.replace(f".{mlx_name}.", f".{st_name}.")
+
+        if per_expert_key in self._tensor_map:
+            # Derive the eid_key template from per_expert_key (which has experts.0.)
+            slices = []
+            for eid in expert_ids:
+                eid_key = per_expert_key.replace(".experts.0.", f".experts.{eid}.")
+                if eid_key not in self._tensor_map:
+                    raise KeyError(eid_key)
+                path, info = self._tensor_map[eid_key]
+                offset = self._data_offsets[path] + info.data_offset
+                np_dtype = self._NP_DTYPES[info.dtype]
+                raw = self._read(path, offset, info.data_size)
+                arr = np.frombuffer(raw, dtype=np_dtype).reshape(info.shape)
+                slices.append(arr)
+            if slices:
+                res = mx.array(np.stack(slices))
+                return res.view(mx.bfloat16) if info.dtype == "BF16" else res
+
+        return None
+
+    def has_key(self, key):
+        return key in self._tensor_map
+
+    def close(self):
+        for mm in self._mmaps.values():
+            mm.close()
+        self._mmaps.clear()
+        for fd in self._fds.values():
+            os.close(fd)
+        self._fds.clear()
+
+
+# -- LCP eviction tracker --
+
+
+class LCPTracker:
+    """LCP eviction with optional layer-depth bias (FATE paper).
+
+    Shallow (early) layers have more predictable routing patterns,
+    so their experts are more valuable to keep cached. The layer_depth_bias
+    multiplies priority by (1 + bias * (1 - layer_frac)) where layer_frac
+    is the layer's position (0=first, 1=last).
+    """
+
+    def __init__(self, num_experts, lcp_base=0.25, lcp_decay=128.0, layer_depth_bias=0.0, layer_frac=0.5):
+        self.num_experts = num_experts
+        self.lcp_base = lcp_base
+        self.lcp_decay = lcp_decay
+        # Shallow-favoring bias: higher for early layers
+        self._depth_multiplier = 1.0 + layer_depth_bias * (1.0 - layer_frac)
+        self.frequency = np.zeros(num_experts, dtype=np.int64)
+        self.last_used = np.zeros(num_experts, dtype=np.int64)
+        self.step = 0
+
+    def record(self, expert_ids):
+        self.step += 1
+        for eid in expert_ids:
+            if 0 <= eid < self.num_experts:
+                self.frequency[eid] += 1
+                self.last_used[eid] = self.step
+
+    def priority(self, eid):
+        age = self.step - self.last_used[eid]
+        base_priority = self.frequency[eid] * (self.lcp_base ** (age / self.lcp_decay))
+        return base_priority * self._depth_multiplier
+
+    def coldest(self, among, n):
+        priorities = [(eid, self.priority(eid)) for eid in among]
+        priorities.sort(key=lambda x: x[1])
+        return [eid for eid, _ in priorities[:n]]
+
+
+# -- Cached QuantizedSwitchLinear replacement --
+
+
+class CachedSwitchLinear(nn.Module):
+    """Drop-in replacement using GPU lookup table + pre-stacked weights."""
+
+    def __init__(self, cache, proj_name, group_size, bits, mode=0):
+        super().__init__()
+        self._cache = cache
+        self._proj_name = proj_name
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+
+    def __call__(self, x, indices, sorted_indices=False):
+        if self._proj_name == "gate_proj" and not self._cache.exact:
+            self._cache._indices_buffer.append(indices)
+
+        local_indices = self._cache.lookup[indices]
+
+        return mx.gather_qmm(
+            x,
+            self._cache.weights[self._proj_name],
+            self._cache.scales[self._proj_name],
+            self._cache.biases.get(self._proj_name),
+            rhs_indices=local_indices,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+            sorted_indices=False,
+        )
+
+
+# -- Expert cache per layer --
+
+
+class ExpertCache:
+    """Pre-stacked expert weights in GPU with LCP eviction."""
+
+    def __init__(self, layer_idx, num_experts, capacity, st_map, weight_keys, num_layers=1, layer_depth_bias=0.3):
+        self.layer_idx = layer_idx
+        self.num_experts = num_experts
+        self.capacity = min(capacity, num_experts)
+        self.st_map = st_map
+        self.weight_keys = weight_keys
+        self.cached_ids = []
+        self.lookup = mx.zeros(num_experts, dtype=mx.int32)
+        self.hit_mask = mx.zeros(num_experts)
+        self.weights = {}
+        self.scales = {}
+        self.biases = {}
+        layer_frac = layer_idx / max(num_layers - 1, 1)
+        self.tracker = LCPTracker(num_experts, layer_depth_bias=layer_depth_bias, layer_frac=layer_frac)
+        self._indices_buffer = []
+        self.total_tokens = 0
+        self.cache_updates = 0
+        self.exact = False
+
+    def initial_fill(self, expert_ids=None):
+        if expert_ids is None:
+            expert_ids = list(range(self.capacity))
+        self.cached_ids = expert_ids[: self.capacity]
+
+        for full_key_name, st_key in self.weight_keys.items():
+            data = self.st_map.get_expert_slice(st_key, self.cached_ids)
+            if data is None:
+                if self.exact:
+                    raise KeyError(st_key)
+                continue
+            parts = full_key_name.split(".")
+            proj = parts[0]  # gate_proj, up_proj, down_proj
+            attr = parts[1]  # weight, scales, biases
+            target = self.weights if attr == "weight" else self.scales if attr == "scales" else self.biases
+            target[proj] = data
+
+        self._rebuild_lookup()
+
+    def _rebuild_lookup(self):
+        lookup_np = np.zeros(self.num_experts, dtype=np.int32)
+        hit_np = np.zeros(self.num_experts, dtype=np.float32)
+        for slot, eid in enumerate(self.cached_ids):
+            lookup_np[eid] = slot
+            hit_np[eid] = 1.0
+        self.lookup = mx.array(lookup_np)
+        self.hit_mask = mx.array(hit_np)
+
+    def ensure(self, indices):
+        """Populate the current routing set BEFORE any expert computation."""
+        ids = np.unique(np.array(indices)).tolist()
+        if len(ids) > self.capacity:
+            raise ValueError("Routing set exceeds resident cache capacity")
+        self._indices_buffer = [indices]
+        self.update_between_tokens()
+        if not set(ids).issubset(self.cached_ids):
+            raise RuntimeError("Expert cache failed to satisfy current routing")
+
+    def update_between_tokens(self):
+        if not self._indices_buffer:
+            return
+        activated = set()
+        for indices in self._indices_buffer:
+            ids = np.array(indices).flatten().tolist()
+            activated.update(ids)
+            self.tracker.record(ids)
+        self._indices_buffer.clear()
+        self.total_tokens += 1
+
+        cached_set = set(self.cached_ids)
+        misses = sorted(eid for eid in activated if eid not in cached_set)
+        if not misses:
+            return
+
+        evict_candidates = [eid for eid in self.cached_ids if eid not in activated]
+        n_to_evict = min(len(misses), len(evict_candidates))
+        to_evict = self.tracker.coldest(evict_candidates, n_to_evict)
+        if not to_evict:
+            return
+
+        new_ids = misses[: len(to_evict)]
+        evict_set = set(to_evict)
+        evict_map = dict(zip(to_evict, new_ids))
+        slots = [i for i, eid in enumerate(self.cached_ids) if eid in evict_set]
+        new_ids_ordered = [evict_map[self.cached_ids[s]] for s in slots]
+        for s, new_eid in zip(slots, new_ids_ordered):
+            self.cached_ids[s] = new_eid
+
+        # Reload only the evicted expert slots in-place from disk
+        slot_idx = mx.array(slots)
+        for full_key_name, st_key in self.weight_keys.items():
+            data = self.st_map.get_expert_slice(st_key, new_ids_ordered)
+            if data is None:
+                if self.exact:
+                    raise KeyError(st_key)
+                continue
+            parts = full_key_name.split(".")
+            proj = parts[0]
+            attr = parts[1]
+            target = self.weights if attr == "weight" else self.scales if attr == "scales" else self.biases
+            if proj in target and len(slots) > 0:
+                target[proj][slot_idx] = data
+                mx.eval(target[proj])
+
+        self._rebuild_lookup()
+        mx.eval(self.lookup, self.hit_mask)
+        self.cache_updates += 1
+
+        # Release evicted expert buffers back to OS (MLX v0.31+)
+        try:
+            mx.clear_cache()
+        except AttributeError:
+            pass  # older MLX versions
+
+    def stats(self):
+        return {
+            "layer": self.layer_idx,
+            "cached": len(self.cached_ids),
+            "capacity": self.capacity,
+            "coverage": len(self.cached_ids) / max(self.num_experts, 1),
+            "tokens": self.total_tokens,
+            "updates": self.cache_updates,
+        }
+
+
+# -- Streaming state --
+
+
+@dataclass
+class StreamingState:
+    caches: list = field(default_factory=list)
+    st_map: object = None
+    model: object = None
+
+    def warmup(self):
+        for cache in self.caches:
+            cache.initial_fill()
+        arrays = []
+        for cache in self.caches:
+            arrays.extend(cache.weights.values())
+            arrays.extend(cache.scales.values())
+            arrays.extend(cache.biases.values())
+        if arrays:
+            mx.eval(*arrays)
+
+    def update(self):
+        for cache in self.caches:
+            cache.update_between_tokens()
+
+    def stats(self):
+        return [c.stats() for c in self.caches]
+
+    def total_cached(self):
+        return sum(len(c.cached_ids) for c in self.caches)
+
+    def avg_coverage(self):
+        if not self.caches:
+            return 0
+        return sum(c.stats()["coverage"] for c in self.caches) / len(self.caches)
+
+    def cleanup(self):
+        if self.st_map:
+            self.st_map.close()
+
+
+class ExactStreamingSwitchGLU(nn.Module):
+    """Load all routed experts, retaining Qwen's original router and scores.
+
+    Decode uses the resident cache. Prefill may need more experts than its
+    capacity: these are loaded temporarily for ONE layer, evaluated, and freed.
+    No instance-level __call__ monkey-patching or missing-expert substitution.
+    """
+
+    def __init__(self, switch, cache):
+        super().__init__()
+        self.switch = switch
+        self._cache = cache
+
+    def __call__(self, x, indices):
+        mx.eval(x, indices)
+        ids = np.unique(np.array(indices)).tolist()
+        cache = self._cache
+        if len(ids) <= cache.capacity:
+            cache.ensure(indices)
+            result = self.switch(x, indices)
+            # Finish using mutable cache slots before the next forward/eviction.
+            mx.eval(result)
+            return result
+
+        temporary = ExpertCache(cache.layer_idx, cache.num_experts, len(ids),
+                                cache.st_map, cache.weight_keys)
+        temporary.exact = True
+        temporary.initial_fill(ids)
+        local_indices = temporary.lookup[indices]
+        expanded = mx.expand_dims(x, (-2, -3))
+
+        def project(name, values):
+            proj = getattr(self.switch, name)
+            return mx.gather_qmm(
+                values, temporary.weights[name], temporary.scales[name],
+                temporary.biases.get(name), rhs_indices=local_indices,
+                transpose=True, group_size=proj.group_size, bits=proj.bits,
+                mode=proj.mode, sorted_indices=False)
+
+        up = project("up_proj", expanded)
+        gate = project("gate_proj", expanded)
+        result = project("down_proj", self.switch.activation(up, gate)).squeeze(-2)
+        mx.eval(result)
+        return result
+
+
+# -- Skip-fallback: zero missing expert scores --
+
+
+def enable_skip_fallback(model, caches: list, adaptive_skip_threshold: float = 0.0):
+    """Monkey-patch MoE blocks to zero scores for uncached experts.
+
+    When an expert is not in the cache, its routing score is set to 0
+    and remaining scores are renormalized. This avoids computing with
+    stale/placeholder weights for uncached experts.
+
+    If adaptive_skip_threshold > 0, also skip low-confidence secondary
+    experts when top-1 score / top-2 score > threshold (LExI paper).
+    E.g., threshold=3.0 means skip expert 2 if expert 1 is 3x more likely.
+    This gives 10-30% compute reduction with <1% quality loss.
+    """
+    import types
+
+    if any(c.exact for c in caches):
+        raise ValueError("Skip fallback is incompatible with exact streaming")
+
+    layers = None
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = model.model.layers
+    elif hasattr(model, "layers"):
+        layers = model.layers
+    if layers is None:
+        return
+
+    cache_by_layer = {c.layer_idx: c for c in caches}
+
+    for layer_idx, layer in enumerate(layers):
+        if layer_idx not in cache_by_layer:
+            continue
+        if not hasattr(layer, "mlp"):
+            continue
+
+        cache = cache_by_layer[layer_idx]
+        mlp = layer.mlp
+        original_call = type(mlp).__call__
+
+        skip_thresh = adaptive_skip_threshold
+
+        def make_patched(orig, cache_ref):
+            def patched_call(self, x):
+                gates = self.gate(x)
+                gates = mx.softmax(gates, axis=-1, precise=True)
+
+                k = self.top_k
+                inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
+                scores = mx.take_along_axis(gates, inds, axis=-1)
+
+                # Zero out scores for uncached experts
+                mask = cache_ref.hit_mask[inds]  # 1.0 cached, 0.0 not
+                scores = scores * mask
+
+                # Adaptive top-k: skip low-confidence secondary experts (LExI)
+                if skip_thresh > 0 and k > 1:
+                    top1 = scores[..., :1]
+                    # Zero out experts where top-1 is much stronger
+                    confidence_mask = mx.where(top1 > skip_thresh * scores, 0.0, 1.0)
+                    # Keep top-1 always
+                    confidence_mask = mx.concatenate([mx.ones_like(scores[..., :1]), confidence_mask[..., 1:]], axis=-1)
+                    scores = scores * confidence_mask
+
+                score_sum = scores.sum(axis=-1, keepdims=True)
+                scores = mx.where(score_sum > 0, scores / score_sum, scores)
+
+                y = self.switch_mlp(x, inds)
+                y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+
+                if hasattr(self, "shared_expert"):
+                    shared = self.shared_expert(x)
+                    if hasattr(self, "shared_expert_gate"):
+                        shared = mx.sigmoid(self.shared_expert_gate(x)) * shared
+                    y = y + shared
+
+                return y
+
+            return patched_call
+
+        mlp.__call__ = types.MethodType(make_patched(original_call, cache), mlp)
+
+
+# -- Profile-based warmup --
+
+
+def get_warmup_experts(task: str = "general", num_layers: int = 24, num_experts: int = 60, top_n: int = 30) -> list:
+    """Get hot experts for a task from pre-computed profiles.
+
+    Uses task_profiler's predefined profiles to determine which experts
+    to pre-load for a given workload type.
+    """
+    try:
+        from mlx_flash_compress.task_profiler import get_predefined_profile
+
+        profile = get_predefined_profile(task, num_layers=num_layers, num_experts=num_experts)
+        hot_experts = profile.get_hot_experts(top_pct=top_n / num_experts)
+
+        # Convert to flat list of expert IDs per layer
+        result = []
+        for layer_idx in range(num_layers):
+            if layer_idx in hot_experts:
+                result.append(hot_experts[layer_idx][:top_n])
+            else:
+                result.append(list(range(top_n)))
+        return result
+    except Exception:
+        # Fallback: first N experts
+        return [list(range(top_n)) for _ in range(num_layers)]
+
+
+# -- Public API --
+
+
+def enable_expert_streaming(model, capacity_per_layer=200, model_path=None,
+                            exact=False, read_mode="mmap"):
+    """Enable expert streaming on a loaded MLX MoE model.
+
+    Replaces QuantizedSwitchLinear with cached versions using
+    pre-stacked GPU tensors and lookup tables.
+    """
+    if capacity_per_layer < 1:
+        raise ValueError("capacity_per_layer must be positive")
+    if exact and getattr(model, "model_type", None) != "qwen3_moe":
+        raise ValueError("Exact streaming is validated for qwen3_moe only")
+    state = StreamingState(model=model)
+
+    layers = None
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = model.model.layers
+    elif hasattr(model, "layers"):
+        layers = model.layers
+    if layers is None:
+        raise ValueError("Cannot find model layers")
+
+    # Find safetensors
+    if model_path:
+        model_dir = Path(model_path)
+        if not model_dir.is_dir():
+            # Try HuggingFace cache
+            import glob
+
+            cache_pattern = os.path.expanduser(
+                f"~/.cache/huggingface/hub/models--{model_path.replace('/', '--')}*/snapshots/*/"
+            )
+            cache_dirs = sorted(glob.glob(cache_pattern))
+            if cache_dirs:
+                model_dir = Path(cache_dirs[-1])
+
+        shards = sorted(model_dir.glob("*.safetensors"))
+        if shards:
+            state.st_map = SafetensorsMap([str(s) for s in shards], read_mode=read_mode)
+
+    if state.st_map is None:
+        raise ValueError("model_path must resolve to local safetensors shards")
+
+    total_layers = len(layers)
+    for layer_idx, layer in enumerate(layers):
+        if not hasattr(layer, "mlp"):
+            continue
+        mlp = layer.mlp
+
+        # Detect switch_mlp (Qwen/DeepSeek) or block_sparse_moe (Mixtral)
+        switch = getattr(mlp, "switch_mlp", None)
+        is_mixtral = False
+        if switch is None:
+            bsm = getattr(mlp, "block_sparse_moe", None)
+            if bsm is not None:
+                switch = getattr(bsm, "switch_mlp", None)
+                is_mixtral = True
+        if switch is None:
+            continue
+
+        # Mixtral safetensors use w1/w2/w3 naming vs gate_proj/up_proj/down_proj
+        _MIXTRAL_MAP = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+
+        num_experts = 0
+        proj_modules = {}
+        weight_keys = {}
+
+        for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+            proj = getattr(switch, proj_name, None)
+            if proj is None:
+                continue
+            w = getattr(proj, "weight", None)
+            if w is not None and len(w.shape) == 3:
+                num_experts = w.shape[0]
+                proj_modules[proj_name] = proj
+                for suffix in ["weight", "scales", "biases"]:
+                    if is_mixtral:
+                        # Mixtral safetensors: block_sparse_moe.switch_mlp.gate_proj.weight
+                        # but also try: block_sparse_moe.experts.E.w1.weight (per-expert)
+                        wk = f"model.layers.{layer_idx}.block_sparse_moe.switch_mlp.{proj_name}.{suffix}"
+                    else:
+                        wk = f"model.layers.{layer_idx}.mlp.switch_mlp.{proj_name}.{suffix}"
+                    weight_keys[f"{proj_name}.{suffix}"] = wk
+
+        if num_experts == 0:
+            continue
+
+        if exact:
+            if capacity_per_layer < mlp.top_k:
+                raise ValueError("Exact cache capacity must be at least top_k")
+            if getattr(mlp, "sharding_group", None) is not None:
+                raise ValueError("Exact streaming does not support distributed sharding")
+            for proj in proj_modules.values():
+                if getattr(proj, "mode", "affine") != "affine" or "bias" in proj:
+                    raise ValueError("Exact streaming requires bias-free affine projections")
+
+        cache = ExpertCache(
+            layer_idx=layer_idx,
+            num_experts=num_experts,
+            capacity=min(capacity_per_layer, num_experts),
+            st_map=state.st_map,
+            weight_keys=weight_keys,
+            num_layers=total_layers,
+        )
+        cache.exact = exact
+        state.caches.append(cache)
+
+        for proj_name, proj in proj_modules.items():
+            replacement = CachedSwitchLinear(
+                cache=cache,
+                proj_name=proj_name,
+                group_size=getattr(proj, "group_size", 64),
+                bits=getattr(proj, "bits", 4),
+                mode=getattr(proj, "mode", 0),
+            )
+            setattr(switch, proj_name, replacement)
+
+        if exact:
+            mlp.switch_mlp = ExactStreamingSwitchGLU(switch, cache)
+
+    return state

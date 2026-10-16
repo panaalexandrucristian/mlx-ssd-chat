@@ -1,0 +1,4 @@
+Încarc Qwen3 30B · SSD offload exact · buget proces 4 GB…
+Gata în 1.4s. Thinking: pornit. q / Ctrl+D: ieșire; /reset: conversație nouă; Ctrl+C: închide.
+
+Tu> ^D\b\bprocess peak RSS=1.41 GB; peak physical footprint=2.69 GB

@@ -1,0 +1,2 @@
+#!/bin/zsh
+exec "$HOME/.local/share/uv/tools/mlx-flash/bin/python" "$HOME/.local/share/mlx-ssd-chat/ai.py" "$@"

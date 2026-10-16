@@ -1,0 +1,17 @@
+
+Tu> 
+Tu> 
+AI> ORBIT-73
+
+Tu> 
+Tu> 
+AI> 4
+
+Tu> 
+Încarc Qwen3 30B · SSD offload exact · buget proces 4 GB…
+Gata în 1.3s. Thinking: oprit. q / Ctrl+D: ieșire; /reset: conversație nouă; Ctrl+C: închide.
+Bugetul de context pentru acest profil este 4096 tokeni, inclusiv răspunsul. Folosește /reset sau un mesaj mai scurt.
+[6 tokeni; primul token 120.4s; decode 2.36 tok/s; prefix reutilizat 0 tokeni; process peak RSS=1.55 GB; peak physical footprint=3.54 GB]
+Conversație resetată.
+[2 tokeni; primul token 7.7s; decode 3.71 tok/s; prefix reutilizat 0 tokeni; process peak RSS=1.55 GB; peak physical footprint=3.54 GB]
+process peak RSS=1.55 GB; peak physical footprint=3.54 GB

@@ -1,0 +1,221 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (e.g. v0.8.0); checkout and package must match
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      PYPI_TOKEN:
+        required: false
+      HOMEBREW_TAP_TOKEN:
+        required: false
+
+concurrency:
+  group: release-targets
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  metadata:
+    name: Validate pinned release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.commit.outputs.sha }}
+      promote: ${{ steps.meta.outputs.promote }}
+      image: ${{ steps.meta.outputs.image }}
+      pypi: ${{ steps.targets.outputs.pypi }}
+      homebrew: ${{ steps.targets.outputs.homebrew }}
+    steps:
+      - name: Validate requested tag before checkout
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          TRUSTED_REF: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          [ "$TRUSTED_REF" = true ] || { echo 'Run publishing from main or a trusted tag so real inference is enforced'; exit 1; }
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Invalid stable release tag'; exit 1; }
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Validate package versions and determine promotion
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$REPOSITORY/releases?per_page=100" > /tmp/releases.json
+          LATEST=$(python scripts/release_metadata.py latest --releases /tmp/releases.json)
+          python scripts/release_metadata.py verify --tag "$TAG" --latest "$LATEST" --repository "$REPOSITORY" >> "$GITHUB_OUTPUT"
+          # Refuse release tags that have never been part of main.
+          git merge-base --is-ancestor HEAD origin/main
+      - name: Pin downstream jobs to the validated commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Detect optional publishing credentials
+        id: targets
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          for target in pypi homebrew; do
+            if { [ "$target" = pypi ] && [ -n "$PYPI_TOKEN" ]; } || { [ "$target" = homebrew ] && [ -n "$HOMEBREW_TAP_TOKEN" ]; }; then
+              echo "$target=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$target=false" >> "$GITHUB_OUTPUT"
+              echo "### $target skipped: optional publishing credential is not configured." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+  test:
+    name: Test pinned release
+    needs: metadata
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install and test
+        run: |
+          python -m pip install '.[compression,dev]'
+          python -m pytest tests/ -v --tb=short
+  qwen-metal:
+    name: Qwen Metal release gate
+    needs: metadata
+    uses: ./.github/workflows/qwen-metal.yml
+    with:
+      source_ref: ${{ needs.metadata.outputs.sha }}
+    secrets: inherit
+  build:
+    name: Build distributions
+    needs: [metadata, test, qwen-metal]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Build and validate package
+        run: |
+          python -m pip install build twine pytest
+          python -m build
+          python -m twine check dist/*
+          MLX_FLASH_DIST_DIR=dist python -m pytest tests/test_package_artifacts.py -q
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-distributions
+          path: dist/*
+          if-no-files-found: error
+  pypi:
+    name: Publish to PyPI (optional credential)
+    needs: [metadata, build]
+    if: needs.metadata.outputs.pypi == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+          skip-existing: true
+  github-release:
+    name: Publish GitHub release and distributions
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-distributions
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          target_commitish: ${{ needs.metadata.outputs.sha }}
+          generate_release_notes: true
+          make_latest: ${{ needs.metadata.outputs.promote }}
+          files: dist/*
+          fail_on_unmatched_files: true
+  docker:
+    name: Publish Linux testing image to GHCR
+    needs: [metadata, test, qwen-metal]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select image tags without downgrading latest
+        id: tags
+        env:
+          IMAGE: ${{ needs.metadata.outputs.image }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          PROMOTE: ${{ needs.metadata.outputs.promote }}
+        run: |
+          echo "tags=$IMAGE:$VERSION$([ "$PROMOTE" != true ] || printf ',%s:latest' "$IMAGE")" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+  update-homebrew:
+    name: Update Homebrew tap (optional credential)
+    needs: [metadata, github-release]
+    if: needs.metadata.outputs.homebrew == 'true' && needs.metadata.outputs.promote == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update formula after GitHub archive is available
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="https://github.com/$REPOSITORY/archive/refs/tags/v$VERSION.tar.gz"
+          curl --fail --location --retry 3 "$ARCHIVE" -o /tmp/release.tar.gz
+          SHA=$(sha256sum /tmp/release.tar.gz | cut -d' ' -f1)
+          gh auth setup-git
+          git clone "https://github.com/$OWNER/homebrew-mlx-flash.git" /tmp/homebrew-tap
+          cd /tmp/homebrew-tap
+          sed -i "s|url \".*\"|url \"$ARCHIVE\"|" Formula/mlx-flash.rb
+          sed -i "s|sha256 \".*\"|sha256 \"$SHA\"|" Formula/mlx-flash.rb
+          printf '{"version": "%s"}\n' "$VERSION" > version.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/mlx-flash.rb version.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Update mlx-flash to v$VERSION"
+          git push origin main

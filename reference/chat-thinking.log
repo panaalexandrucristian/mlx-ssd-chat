@@ -1,0 +1,38 @@
+Încarc Qwen3 30B · SSD offload exact · buget proces 4 GB…
+Gata în 1.3s. Thinking: pornit. q / Ctrl+D: ieșire; /reset: conversație nouă; Ctrl+C: închide.
+
+Tu> Remember this code: LUNA-47. Reply only OK. Think briefly.
+
+AI> <think>
+Okay, the user said, "Remember this code: LUNA-47. Reply only OK. Think briefly." So they want me to remember the code LUNA-47 and just respond with "OK". They mentioned to reply only with OK, so I shouldn't add anything else. Let me make sure I'm not missing any steps. The task is straightforward: remember the code and confirm with OK. No need for extra explanations. Just a simple acknowledgment. Alright, that's all.
+</think>
+
+OK
+[109 tokeni; primul token 8.2s; decode 2.58 tok/s; prefix reutilizat 0 tokeni; process peak RSS=1.77 GB; peak physical footprint=3.24 GB]
+
+Tu> What code did I ask you to remember? Reply only with the code. Think briefly.
+
+AI> <think>
+Okay, the user is asking me to recall a code they previously asked me to remember. Let me check the conversation history.
+
+In the first message, they said, "Remember this code: LUNA-47. Reply only OK. Think briefly." So I responded with "OK". Now the user is asking, "What code did I ask you to remember? Reply only with the code. Think briefly."
+
+Since the code was LUNA-47, and they want just the code as the answer, I should respond with "LUNA-47". I need to make sure I don't add anything else, just the code. The user emphasized replying only with the code, so I should keep it straightforward.
+</think>
+
+LUNA-47
+[161 tokeni; primul token 6.4s; decode 2.53 tok/s; prefix reutilizat 26 tokeni; process peak RSS=1.77 GB; peak physical footprint=3.27 GB]
+
+Tu> /reset
+Conversație resetată.
+
+Tu> What is 2 + 2? Reply briefly. Think briefly.
+
+AI> <think>
+Okay, the user is asking "What is 2 + 2?" and wants a brief reply. Let me think quickly. 2 plus 2 is a basic arithmetic problem. The answer should be 4. I need to make sure there's no trick or anything here. The question seems straightforward. So the answer is 4. Just need to state it clearly and concisely.
+</think>
+
+2 + 2 = 4.
+[93 tokeni; primul token 7.0s; decode 2.38 tok/s; prefix reutilizat 0 tokeni; process peak RSS=1.77 GB; peak physical footprint=3.29 GB]
+
+Tu> 

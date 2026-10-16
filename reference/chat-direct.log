@@ -1,0 +1,22 @@
+Încarc Qwen3 30B · SSD offload exact · buget proces 4 GB…
+Gata în 1.4s. Thinking: oprit. q / Ctrl+D: ieșire; /reset: conversație nouă; Ctrl+C: închide.
+
+Tu> Remember this code: LUNA-47. Reply only OK. Think briefly.
+
+AI> OK.
+[3 tokeni; primul token 8.6s; decode 3.03 tok/s; prefix reutilizat 0 tokeni; process peak RSS=1.70 GB; peak physical footprint=3.24 GB]
+
+Tu> What code did I ask you to remember? Reply only with the code. Think briefly.
+
+AI> LUNA-47
+[7 tokeni; primul token 7.1s; decode 2.18 tok/s; prefix reutilizat 26 tokeni; process peak RSS=1.78 GB; peak physical footprint=3.33 GB]
+
+Tu> /reset
+Conversație resetată.
+
+Tu> What is 2 + 2? Reply briefly. Think briefly.
+
+AI> 4
+[2 tokeni; primul token 7.5s; decode 3.61 tok/s; prefix reutilizat 0 tokeni; process peak RSS=1.78 GB; peak physical footprint=3.35 GB]
+
+Tu> 

@@ -1,0 +1,1761 @@
+"""Memory-aware MLX inference server with progressive warm-up.
+
+Provides an OpenAI-compatible chat API endpoint that:
+  1. Monitors RAM and warns when memory is tight
+  2. Shows cache warm-up progress per session
+  3. Auto-applies mixed precision when RAM pressure is detected
+  4. Provides real-time memory/cache status endpoint
+
+Usage:
+  python -m mlx_flash_compress.serve --model mlx-community/Qwen3-30B-A3B-4bit
+  python -m mlx_flash_compress.serve --model PATH --port 8080
+
+Then use any OpenAI-compatible client:
+  curl http://localhost:8080/v1/chat/completions \\
+    -H "Content-Type: application/json" \\
+    -d '{"model": "local", "messages": [{"role": "user", "content": "Hello"}]}'
+
+Or from LM Studio: Add custom endpoint http://localhost:8080/v1
+"""
+
+import argparse
+import gc
+import json
+import math
+import os
+import pathlib
+import signal
+import sys
+import threading
+import time
+import uuid
+from functools import wraps
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from typing import Optional
+
+import mlx.core as mx
+import yaml
+from mlx_lm import generate, load, stream_generate
+from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+from mlx_flash_compress.chat_profiles import (
+    ChatTemplateProfileError,
+    chat_template_profile,
+    current_chat_template_kwargs,
+    format_chat_messages,
+    validate_chat_template_kwargs,
+)
+from mlx_flash_compress.hardware import detect_hardware
+from mlx_flash_compress.log_config import setup_logging
+from mlx_flash_compress.memory_manager import MemoryManager, get_memory_state
+from mlx_flash_compress.prompt_reuse import PromptReuse
+from mlx_flash_compress.telemetry import HardwareTelemetry
+
+# Module-level logger, configured in main()
+logger = None
+
+# Available speculative decoding engines
+SPECULATIVE_ENGINES = ("eagle3", "layerskip", "dflash", "none")
+
+# Path to the model registry YAML
+MODELS_YAML = pathlib.Path(__file__).parent.parent / "scripts" / "models.yaml"
+
+
+def native_state_operation(handler):
+    """Keep administrative native operations exclusive with unbatched chat."""
+
+    @wraps(handler)
+    def locked(self, *args, **kwargs):
+        with self.server_state.chat_lock:
+            return handler(self, *args, **kwargs)
+
+    return locked
+
+
+def load_model_registry() -> dict:
+    """Load the model registry from models.yaml."""
+    with open(MODELS_YAML) as f:
+        return yaml.safe_load(f)
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """HTTP server that handles each request in a new thread."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class InferenceState:
+    """Shared state for the inference server."""
+
+    def __init__(
+        self,
+        model_name: str,
+        cache_budget_pct: float = 0.8,
+        kv_bits: int = 0,
+        batching: bool = False,
+        speculative: str = "none",
+        request_timeout: float = 120.0,
+        safety_margin_gb: float = 2.0,
+        prompt_cache_bytes: int = 512 * 1024 * 1024,
+        prompt_cache_entries: int = 8,
+    ):
+        self.model_name = model_name
+        self.model = None
+        self.tokenizer = None
+        self.kv_bits = kv_bits  # 0 = no KV quant, 8 = 8-bit (45% savings)
+        self.hw = detect_hardware()
+        self.mem_mgr = MemoryManager(safety_margin_gb=safety_margin_gb)
+        self.cache_budget_pct = cache_budget_pct
+        self.batching = batching
+        self.speculative = speculative  # "eagle3", "layerskip", "dflash", or "none"
+        self.request_timeout = request_timeout
+        self.engine = None  # ContinuousBatchingEngine, created after model load
+        self.spec_engine = None  # Speculative decoding engine, created after model load
+        self.chat_lock = threading.RLock()
+        self.prompt_reuse = PromptReuse(prompt_cache_bytes, prompt_cache_entries)
+
+        # Hardware telemetry
+        self.telemetry = HardwareTelemetry()
+
+        # Stats
+        self.total_requests = 0
+        self.total_tokens = 0
+        self.last_generation = None
+        self.start_time = time.monotonic()
+
+    def capabilities(self):
+        family = getattr(self.model, "model_type", None)
+        if not isinstance(family, str):
+            try:
+                family = json.loads((pathlib.Path(self.model_name) / "config.json").read_text())["model_type"]
+            except (OSError, ValueError, KeyError, TypeError):
+                family = "unknown"
+        controlled = family.startswith("qwen") or family in ("gemma4", "gemma4_text")
+        return {
+            "model_family": family,
+            "thinking_control": controlled and not self.batching,
+            "reasoning_format": "gemma"
+            if family.startswith("gemma4")
+            else "think"
+            if controlled or family == "lfm2_moe"
+            else "none",
+            "chat_template_kwargs": ["enable_thinking"] if controlled and not self.batching else [],
+        }
+
+    def load_model(self):
+        """Load the model with memory checks."""
+        global logger
+        self.prompt_reuse.clear()
+        log = logger or __import__("logging").getLogger("mlx_flash")
+        mem = get_memory_state()
+        log.info(
+            "Memory before load",
+            extra={
+                "action": "pre_load_memory",
+                "memory_gb": round(mem.total_gb, 1),
+                "pressure": mem.pressure_level,
+            },
+        )
+
+        if mem.pressure_level == "critical":
+            log.warning(
+                "Memory pressure CRITICAL — loading anyway",
+                extra={
+                    "action": "critical_pressure_warning",
+                    "memory_gb": round(mem.available_gb, 1),
+                },
+            )
+
+        log.info("Loading model", extra={"model": self.model_name, "action": "model_load_start"})
+
+        # Pre-download with progress if not cached locally
+        if not os.path.isdir(self.model_name):
+            try:
+                from huggingface_hub import snapshot_download
+
+                if hasattr(self, "_switch_progress") and self._switch_progress:
+                    self._switch_progress["phase"] = "downloading"
+                    self._switch_progress["percent"] = 15
+                log.info("Downloading model files", extra={"model": self.model_name, "action": "download_start"})
+                snapshot_download(
+                    self.model_name,
+                    allow_patterns=["*.safetensors", "*.json", "tokenizer*"],
+                )
+                log.info("Download complete", extra={"model": self.model_name, "action": "download_complete"})
+            except Exception:
+                pass  # mlx_lm.load will handle download as fallback
+
+        if hasattr(self, "_switch_progress") and self._switch_progress:
+            self._switch_progress["phase"] = "loading"
+            self._switch_progress["percent"] = 50
+
+        t0 = time.monotonic()
+        self.model, self.tokenizer = load(self.model_name)
+        mx.synchronize()
+        load_time = time.monotonic() - t0
+        log.info(
+            "Model loaded",
+            extra={
+                "model": self.model_name,
+                "load_time_s": round(load_time, 1),
+                "action": "model_load_complete",
+            },
+        )
+
+        if hasattr(self, "_switch_progress") and self._switch_progress:
+            self._switch_progress["phase"] = "warming"
+            self._switch_progress["percent"] = 85
+
+        # Warmup: compile Metal shaders and allocate KV cache
+        log.info("Warming up (compiling Metal shaders)", extra={"action": "warmup_start"})
+        t_warm = time.monotonic()
+        warmup_prompt = "Hello"
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                warmup_prompt = self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": "Hi"}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                pass
+        _ = generate(self.model, self.tokenizer, prompt=warmup_prompt, max_tokens=5, verbose=False)
+        mx.synchronize()
+        log.info(
+            "Warm-up done",
+            extra={
+                "load_time_s": round(time.monotonic() - t_warm, 1),
+                "action": "warmup_complete",
+            },
+        )
+
+        # Check post-load memory
+        mem_after = get_memory_state()
+        model_size_gb = mem.available_gb - mem_after.available_gb
+        log.info(
+            "Post-load memory",
+            extra={
+                "model": self.model_name,
+                "memory_gb": round(mem_after.available_gb, 1),
+                "pressure": mem_after.pressure_level,
+                "action": "post_load_memory",
+            },
+        )
+
+        if mem_after.pressure_level in ("warning", "critical"):
+            log.warning(
+                "Memory pressure detected after model load",
+                extra={
+                    "pressure": mem_after.pressure_level,
+                    "memory_gb": round(mem_after.available_gb, 1),
+                },
+            )
+            self._suggest_memory_actions(mem_after)
+
+        # Auto mixed-precision: if model barely fits, reduce footprint
+        try:
+            footprint = mx.get_peak_memory() / (1024**3)
+            headroom = mem_after.available_gb
+            if headroom < footprint * 0.15:  # less than 15% headroom
+                print(f"\n  Model barely fits ({footprint:.1f}GB, {headroom:.1f}GB free)")
+                print("  Hint: run with --mixed-precision to reduce footprint by ~20%")
+        except AttributeError:
+            pass
+
+        # Initialize continuous batching engine if enabled
+        if self.batching and self.engine is None:
+            from mlx_flash_compress.continuous_batching import ContinuousBatchingEngine
+
+            log.info("Starting continuous batching engine", extra={"action": "batching_start"})
+            self.engine = ContinuousBatchingEngine(self.model, self.tokenizer)
+            self.engine.start()
+
+        # Initialize speculative decoding engine if enabled
+        if self.speculative != "none" and self.spec_engine is None:
+            self._init_speculative_engine(log)
+
+    def _init_speculative_engine(self, log):
+        """Initialize the configured speculative decoding engine."""
+        if self.speculative == "eagle3":
+            from mlx_flash_compress.eagle3 import EAGLE3Engine
+
+            log.info("Initializing EAGLE-3 speculative decoding", extra={"action": "spec_init", "engine": "eagle3"})
+            self.spec_engine = EAGLE3Engine(self.model, self.tokenizer)
+        elif self.speculative == "layerskip":
+            from mlx_flash_compress.layerskip import LayerSkipEngine
+
+            log.info(
+                "Initializing LayerSkip speculative decoding", extra={"action": "spec_init", "engine": "layerskip"}
+            )
+            self.spec_engine = LayerSkipEngine(self.model, self.tokenizer)
+        elif self.speculative == "dflash":
+            from mlx_flash_compress.dflash import DFlashEngine
+
+            log.info("Initializing DFlash speculative decoding", extra={"action": "spec_init", "engine": "dflash"})
+            self.spec_engine = DFlashEngine(
+                self.model,
+                drafter=None,
+                config=__import__("mlx_flash_compress.dflash", fromlist=["DFlashConfig"]).DFlashConfig(),
+                tokenizer=self.tokenizer,
+            )
+        else:
+            log.warning(
+                f"Unknown speculative engine: {self.speculative}",
+                extra={"action": "spec_init_failed", "engine": self.speculative},
+            )
+
+    def _suggest_memory_actions(self, mem):
+        """Suggest actions to reduce memory pressure."""
+        global logger
+        log = logger or __import__("logging").getLogger("mlx_flash")
+        log.warning(
+            "Memory optimization suggestions: close browser tabs, Xcode, Docker. "
+            "Or use a smaller model / enable mixed precision.",
+            extra={
+                "action": "memory_suggestions",
+                "memory_gb": round(mem.available_gb, 1),
+            },
+        )
+
+    def get_status(self) -> dict:
+        """Get current server status with optimization hints."""
+        mem = get_memory_state()
+        uptime = time.monotonic() - self.start_time
+        cache_budget = self.mem_mgr.get_cache_budget_gb()
+        hints = self.mem_mgr.get_optimization_hints()
+
+        status = {
+            "model": self.model_name,
+            "model_loaded": self.model is not None,
+            "hardware": {
+                "chip": self.hw.chip,
+                "ram_gb": self.hw.total_ram_gb,
+            },
+            "memory": {
+                "total_gb": round(mem.total_gb, 1),
+                "free_gb": round(mem.free_gb, 1),
+                "available_gb": round(mem.available_gb, 1),
+                "pressure": mem.pressure_level,
+                "cache_budget_gb": round(cache_budget, 1),
+                "swap_used_gb": round(mem.swap_used_gb, 1),
+            },
+            "stats": {
+                "requests": self.total_requests,
+                "tokens_generated": self.total_tokens,
+                "uptime_s": round(uptime, 0),
+                "last_generation": self.last_generation,
+            },
+            "optimization_hints": hints,
+            "speculative_engine": self.speculative,
+            "prompt_cache": {
+                **self.prompt_reuse.stats(),
+                "enabled": self.prompt_reuse.max_bytes > 0 and not self.batching and self.speculative == "none",
+            },
+            "optimizations": {
+                "prompt_cache": self.prompt_reuse.max_bytes > 0 and not self.batching and self.speculative == "none",
+                "speculative": self.speculative,
+                "batching": self.batching,
+                "kv_quantization_bits": self.kv_bits,
+                "repetition_penalty": (
+                    self.last_generation.get("repetition_penalty")
+                    if self.last_generation
+                    else 1.05
+                    if self.capabilities()["model_family"] == "lfm2_moe"
+                    else None
+                ),
+            },
+        }
+        if self.spec_engine is not None:
+            try:
+                if hasattr(self.spec_engine, "get_stats"):
+                    status["speculative_stats"] = self.spec_engine.get_stats()
+                elif hasattr(self.spec_engine, "get_stats_summary"):
+                    status["speculative_stats"] = self.spec_engine.get_stats_summary()
+            except Exception:
+                pass
+        return status
+
+    def generate(
+        self,
+        messages: list[dict],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        cache_scope: str = "default",
+        repetition_penalty: Optional[float] = None,
+    ) -> dict:
+        """Generate a response with memory awareness."""
+        if self.model is None:
+            self.load_model()
+
+        # Check memory before generation — auto-release if needed
+        log = logger or __import__("logging").getLogger("mlx_flash")
+        mem = get_memory_state()
+        release_info = None
+        if mem.pressure_level in ("critical", "warning"):
+            self.prompt_reuse.clear()
+            log.warning(
+                "Memory pressure before generation",
+                extra={
+                    "action": "pressure_pre_generate",
+                    "pressure": mem.pressure_level,
+                    "memory_gb": round(mem.available_gb, 1),
+                },
+            )
+            release_info = self.mem_mgr.auto_release_if_needed()
+            mem = get_memory_state()  # re-check after release
+
+        if mem.pressure_level == "critical":
+            hints = self.mem_mgr.get_optimization_hints()
+            return {
+                "error": "Memory pressure is critical. Close applications to free RAM.",
+                "memory": {
+                    "available_gb": round(mem.available_gb, 1),
+                    "pressure": mem.pressure_level,
+                },
+                "optimization_hints": hints,
+                "auto_release": release_info,
+            }
+
+        # Format prompt
+        prompt = self._format_messages(messages)
+
+        # Generate — use speculative engine if available
+        t0 = time.monotonic()
+        spec_stats = None
+        metrics = {}
+        if self.spec_engine is not None:
+            if temperature != 0 or top_p != 1.0 or top_k != 0:
+                return {"error": "Speculative engines support only greedy temperature=0 without top_p/top_k filters"}
+            prompt_tokens = mx.array(self.tokenizer.encode(prompt))
+            result_tokens = self.spec_engine.generate(prompt_tokens, max_tokens=max_tokens)
+            mx.synchronize()
+            output = self.tokenizer.decode(result_tokens.tolist()[len(prompt_tokens) :])
+            generated = result_tokens.tolist()[len(prompt_tokens) :]
+            tokens = len(generated)
+            eos = set(getattr(self.tokenizer, "eos_token_ids", []) or [])
+            if getattr(self.tokenizer, "eos_token_id", None) is not None:
+                eos.add(self.tokenizer.eos_token_id)
+            finish = "stop" if any(token in eos for token in generated) else "length" if tokens >= max_tokens else None
+            metrics = {
+                "prompt_tokens": len(prompt_tokens),
+                "finish_reason": finish,
+                "generation_tps": None,
+                "prompt_tps": None,
+                "ttft_ms": None,
+                "peak_memory_gb": None,
+                "native_generation_metadata": False,
+                "usage_source": "exact_speculative_tokens",
+            }
+            if hasattr(self.spec_engine, "get_stats"):
+                spec_stats = self.spec_engine.get_stats()
+            elif hasattr(self.spec_engine, "get_stats_summary"):
+                spec_stats = self.spec_engine.get_stats_summary()
+        else:
+            sampler = make_sampler(temp=temperature, top_p=top_p, top_k=top_k)
+            add_special = self.tokenizer.bos_token is None or not prompt.startswith(self.tokenizer.bos_token)
+            input_tokens = self.tokenizer.encode(prompt, add_special_tokens=add_special)
+            namespace = (self.model_name, tuple(sorted(current_chat_template_kwargs().items())), cache_scope)
+            native_cache, rest = self.prompt_reuse.lookup(namespace, input_tokens)
+            reused = len(input_tokens) - len(rest)
+            if native_cache is None:
+                native_cache = make_prompt_cache(self.model)
+            if repetition_penalty is None and self.capabilities()["model_family"] == "lfm2_moe":
+                repetition_penalty = 1.05
+            processors = (
+                make_logits_processors(repetition_penalty=repetition_penalty) if repetition_penalty is not None else []
+            )
+            if reused and processors:
+                # Native generate_step sees only the uncached suffix. Restore
+                # full sampling history without reprocessing the cached input.
+                prefix = mx.array(input_tokens[:reused])
+                processors = [
+                    lambda tokens, logits, fn=fn: fn(mx.concatenate([prefix, tokens]), logits) for fn in processors
+                ]
+
+            def prefill_progress(processed, total):
+                # The total==processed callback happens AFTER native decode
+                # lookahead mutates recurrent state. Only snapshot prefill.
+                if mem.pressure_level == "normal" and self.prompt_reuse.max_bytes and 0 < processed == total - 1:
+                    self.prompt_reuse.store(namespace, input_tokens[: reused + processed], native_cache)
+
+            segments = []
+            last = None
+            ttft_ms = None
+            for response in stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt=rest,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                prompt_cache=native_cache,
+                prompt_progress_callback=prefill_progress,
+                kv_bits=self.kv_bits or None,
+                logits_processors=processors,
+            ):
+                if ttft_ms is None:
+                    ttft_ms = (time.monotonic() - t0) * 1000
+                segments.append(response.text)
+                last = response
+            if last is None or last.finish_reason not in ("stop", "length"):
+                raise RuntimeError("Native generator did not provide a completed response")
+            output = "".join(segments)
+            tokens = last.generation_tokens
+            self.prompt_reuse.record_completed(reused, len(rest))
+            metrics = {
+                "prompt_tokens": len(input_tokens),
+                "cached_prompt_tokens": reused,
+                "processed_prompt_tokens": len(rest),
+                "repetition_penalty": repetition_penalty,
+                "finish_reason": last.finish_reason,
+                "generation_tps": last.generation_tps,
+                "prompt_tps": last.prompt_tps,
+                "ttft_ms": ttft_ms,
+                "peak_memory_gb": last.peak_memory,
+                "native_generation_metadata": True,
+                "usage_source": "exact_mlx_lm_generation",
+            }
+        mx.synchronize()
+        elapsed = time.monotonic() - t0
+
+        tps = tokens / elapsed if elapsed > 0 else 0
+
+        with self.chat_lock:
+            self.total_requests += 1
+            self.total_tokens += tokens
+            self.last_generation = {"generation_tokens": tokens, "time_s": elapsed, **metrics}
+
+        log.info(
+            "Inference complete",
+            extra={
+                "action": "inference_complete",
+                "tokens": tokens,
+                "tok_per_s": round(tps, 1),
+                "latency_ms": round(elapsed * 1000),
+                "speculative": self.speculative,
+            },
+        )
+
+        # Check memory after generation
+        mem_after = get_memory_state()
+        if mem_after.pressure_level in ("critical", "warning"):
+            log.warning(
+                "Memory pressure after generation",
+                extra={
+                    "action": "pressure_post_generate",
+                    "pressure": mem_after.pressure_level,
+                    "memory_gb": round(mem_after.available_gb, 1),
+                },
+            )
+
+        result = {
+            "output": output,
+            "tokens": tokens,
+            "time_s": round(elapsed, 2),
+            "tok_per_s": round(tps, 1),
+            "memory_pressure": mem_after.pressure_level,
+            **metrics,
+        }
+        if spec_stats is not None:
+            result["speculative_stats"] = spec_stats
+        return result
+
+    def _format_messages(self, messages: list[dict]) -> str:
+        """Format chat messages for the model."""
+        return format_chat_messages(self.tokenizer, messages)
+
+
+class ChatHandler(BaseHTTPRequestHandler):
+    """HTTP handler for OpenAI-compatible chat API."""
+
+    server_state: InferenceState = None  # set by server setup
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            self._send_json(
+                {
+                    "data": [
+                        {
+                            "id": "local",
+                            "object": "model",
+                            "owned_by": "mlx-flash",
+                        }
+                    ]
+                }
+            )
+        elif self.path == "/v1/engines":
+            state = self.server_state
+            engines = []
+            for eng in SPECULATIVE_ENGINES:
+                engines.append(
+                    {
+                        "id": eng,
+                        "active": eng == state.speculative,
+                        "description": {
+                            "eagle3": "EAGLE-3: Autoregression head for hidden-state speculation (2.7-3.5x speedup)",
+                            "layerskip": "LayerSkip: Self-speculative decoding via early exit (1.8-2.2x speedup)",
+                            "dflash": "DFlash: Block diffusion parallel drafting (2-3x speedup)",
+                            "none": "Standard autoregressive decoding",
+                        }.get(eng, ""),
+                    }
+                )
+            self._send_json({"engines": engines})
+        elif self.path == "/health":
+            state = self.server_state
+            mem = get_memory_state()
+            self._send_json(
+                {
+                    "status": "ok",
+                    "model": state.model_name,
+                    "model_loaded": state.model is not None,
+                    "speculative_engine": state.speculative,
+                    "memory_pressure": mem.pressure_level,
+                    "uptime_s": round(time.monotonic() - state.start_time, 0),
+                    "capabilities": state.capabilities(),
+                }
+            )
+        elif self.path == "/status":
+            self._send_json(self.server_state.get_status())
+        elif self.path == "/hints":
+            hints = self.server_state.mem_mgr.get_optimization_hints()
+            self._send_json({"hints": hints})
+        elif self.path == "/release":
+            with self.server_state.chat_lock:
+                self.server_state.prompt_reuse.clear()
+                result = self.server_state.mem_mgr.auto_release_if_needed()
+            self._send_json(result)
+        elif self.path == "/metrics":
+            self._serve_metrics()
+        elif self.path == "/chat":
+            self._serve_chat_html()
+        elif self.path == "/config":
+            self._handle_config_get()
+        elif self.path == "/admin":
+            self._serve_dashboard_html()
+        elif self.path == "/profile/models":
+            self._handle_profile_models()
+        elif self.path == "/telemetry":
+            self._handle_telemetry()
+        elif self.path == "/telemetry/current":
+            self._handle_telemetry_current()
+        elif self.path == "/switch/progress":
+            self._handle_switch_progress()
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    def do_POST(self):
+        if self.path == "/v1/chat/completions":
+            self._handle_chat()
+        elif self.path in ("/switch", "/v1/models/switch"):
+            self._handle_switch()
+        elif self.path == "/reload":
+            self._handle_reload()
+        elif self.path == "/shutdown":
+            self._handle_shutdown()
+        elif self.path == "/config":
+            self._handle_config_set()
+        elif self.path == "/profile":
+            self._handle_profile()
+        elif self.path == "/profile/batch":
+            self._handle_profile_batch()
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    @native_state_operation
+    def _handle_switch(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._send_json({"error": "Invalid JSON"}, 400)
+            return
+
+        new_model = data.get("model")
+        if not new_model:
+            self._send_json({"error": "Missing 'model' field"}, 400)
+            return
+
+        state = self.server_state
+        old_model = state.model_name
+        log = logger or __import__("logging").getLogger("mlx_flash")
+        log.info("Switching model", extra={"model": new_model, "action": "model_switch"})
+
+        # Check if model is cached before starting
+        is_cached = False
+        cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+        dir_name = f"models--{new_model.replace('/', '--')}"
+        if os.path.isdir(os.path.join(cache_dir, dir_name)):
+            is_cached = True
+
+        # Update switch progress for polling
+        state._switch_progress = {
+            "phase": "unloading",
+            "model": new_model,
+            "cached": is_cached,
+            "percent": 0,
+        }
+
+        # Unload current model
+        state.model = None
+        state.tokenizer = None
+        state.prompt_reuse.clear()
+        import gc
+
+        gc.collect()
+        try:
+            mx.clear_cache()
+        except AttributeError:
+            pass
+
+        # Load new model
+        state.model_name = new_model
+        state._switch_progress["phase"] = "downloading" if not is_cached else "loading"
+        state._switch_progress["percent"] = 10
+
+        try:
+            state.load_model()
+            state._switch_progress = None
+            self._send_json(
+                {
+                    "switched": True,
+                    "model": new_model,
+                    "previous": old_model,
+                }
+            )
+        except Exception as e:
+            state._switch_progress = None
+            # Rollback on failure
+            state.model_name = old_model
+            self._send_json(
+                {
+                    "switched": False,
+                    "error": str(e),
+                    "model": old_model,
+                },
+                500,
+            )
+
+    def _handle_switch_progress(self):
+        """Return current model switch progress for UI polling."""
+        state = self.server_state
+        progress = getattr(state, "_switch_progress", None)
+        if progress is None:
+            self._send_json({"switching": False, "model": state.model_name, "model_loaded": state.model is not None})
+        else:
+            self._send_json({"switching": True, **progress})
+
+    def _handle_reload(self):
+        """Reload: refresh memory state, log status."""
+        log = logger or __import__("logging").getLogger("mlx_flash")
+        log.info("Reload requested via /reload", extra={"action": "reload"})
+        mem = get_memory_state()
+        state = self.server_state
+        self._send_json(
+            {
+                "reloaded": True,
+                "model": state.model_name,
+                "model_loaded": state.model is not None,
+                "memory_available_gb": round(mem.available_gb, 1),
+                "pressure": mem.pressure_level,
+            }
+        )
+
+    def _handle_shutdown(self):
+        """Graceful shutdown via API."""
+        log = logger or __import__("logging").getLogger("mlx_flash")
+        log.info("Shutdown requested via /shutdown", extra={"action": "shutdown"})
+        self._send_json(
+            {
+                "shutting_down": True,
+                "message": "Server stopping in ~500ms",
+            }
+        )
+        import threading
+
+        def _stop():
+            time.sleep(0.5)
+            self.server.shutdown()
+
+        threading.Thread(target=_stop, daemon=True).start()
+
+    def _handle_config_get(self):
+        state = self.server_state
+        mem = get_memory_state()
+        config = {
+            "model": state.model_name,
+            "model_loaded": state.model is not None,
+            "speculative": state.speculative,
+            "kv_bits": state.kv_bits,
+            "cache_budget_pct": state.cache_budget_pct,
+            "batching": state.batching,
+            "request_timeout": state.request_timeout,
+            "memory": {
+                "total_gb": round(mem.total_gb, 1),
+                "available_gb": round(mem.available_gb, 1),
+                "pressure": mem.pressure_level,
+            },
+            "stats": {
+                "total_requests": state.total_requests,
+                "total_tokens": state.total_tokens,
+                "uptime_secs": round(time.monotonic() - state.start_time, 1),
+            },
+        }
+        if state.spec_engine is not None and hasattr(state.spec_engine, "get_stats"):
+            config["speculative_stats"] = state.spec_engine.get_stats()
+        self._send_json(config)
+
+    @native_state_operation
+    def _handle_config_set(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._send_json({"error": "Invalid JSON"}, 400)
+            return
+
+        state = self.server_state
+        updated = []
+        if "cache_budget_pct" in data:
+            state.cache_budget_pct = float(data["cache_budget_pct"])
+            updated.append("cache_budget_pct")
+        if "kv_bits" in data:
+            state.prompt_reuse.clear()
+            state.kv_bits = int(data["kv_bits"])
+            updated.append("kv_bits")
+        if "request_timeout" in data:
+            state.request_timeout = float(data["request_timeout"])
+            updated.append("request_timeout")
+        if "batching" in data:
+            state.batching = bool(data["batching"])
+            updated.append("batching")
+        self._send_json({"updated": updated, "status": "ok"})
+
+    @native_state_operation
+    def _handle_profile(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._send_json({"error": "Invalid JSON"}, 400)
+            return
+
+        state = self.server_state
+        if state.model is None:
+            self._send_json({"error": "No model loaded"}, 503)
+            return
+
+        max_tokens = data.get("max_tokens", 32)
+        prompt_text = data.get("prompt", "def binary_search(arr, target):\n    ")
+
+        prompt_tokens = mx.array(state.tokenizer.encode(prompt_text))
+        mem_before = get_memory_state()
+        t0 = time.monotonic()
+
+        output = generate(
+            state.model,
+            state.tokenizer,
+            prompt=prompt_text,
+            max_tokens=max_tokens,
+            verbose=False,
+        )
+        mx.synchronize()
+
+        elapsed = time.monotonic() - t0
+        out_tokens = len(state.tokenizer.encode(output))
+        mem_after = get_memory_state()
+
+        self._send_json(
+            {
+                "model": state.model_name,
+                "prompt_tokens": len(prompt_tokens),
+                "output_tokens": out_tokens,
+                "elapsed_secs": round(elapsed, 3),
+                "tokens_per_sec": round(out_tokens / elapsed, 1) if elapsed > 0 else 0,
+                "memory_before_gb": round(mem_before.available_gb, 2),
+                "memory_after_gb": round(mem_after.available_gb, 2),
+            }
+        )
+
+    def _handle_profile_models(self):
+        """Return the model registry from models.yaml without profiling."""
+        try:
+            registry = load_model_registry()
+        except Exception as e:
+            self._send_json({"error": f"Cannot read models.yaml: {e}"}, 500)
+            return
+
+        models = []
+        for m in registry.get("models", []):
+            models.append(
+                {
+                    "id": m.get("id", ""),
+                    "category_expected": m.get("category_expected", "unknown"),
+                    "size_gb_approx": m.get("size_gb_approx", 0),
+                    "skip": m.get("skip", False),
+                    "notes": m.get("notes", ""),
+                    "drafter": m.get("drafter"),
+                }
+            )
+
+        self._send_json(
+            {
+                "models": models,
+                "cache_dir": registry.get("cache_dir", "~/.cache/huggingface/hub"),
+                "total_models": len(models),
+            }
+        )
+
+    @native_state_operation
+    def _handle_profile_batch(self):
+        """Profile multiple models from the registry sequentially."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._send_json({"error": "Invalid JSON"}, 400)
+            return
+
+        max_tokens = data.get("max_tokens", 32)
+        prompt_text = data.get("prompt", "def binary_search(arr, target):\n    ")
+        requested_models = data.get("models", [])
+
+        # Load registry
+        try:
+            registry = load_model_registry()
+        except Exception as e:
+            self._send_json({"error": f"Cannot read models.yaml: {e}"}, 500)
+            return
+
+        # Build the list of models to profile
+        registry_models = registry.get("models", [])
+        if requested_models:
+            # Filter to only requested models
+            models_to_profile = [m for m in registry_models if m.get("id") in requested_models]
+        else:
+            # Profile all non-skipped models
+            models_to_profile = [m for m in registry_models if not m.get("skip", False)]
+
+        log = logger or __import__("logging").getLogger("mlx_flash")
+        state = self.server_state
+        original_model = state.model_name
+        results = []
+
+        for entry in models_to_profile:
+            model_id = entry.get("id", "")
+            category = entry.get("category_expected", "unknown")
+            log.info(
+                f"Batch profiling model: {model_id}",
+                extra={"action": "batch_profile_start", "model": model_id},
+            )
+
+            result = {"model": model_id, "category": category}
+
+            try:
+                # Unload any currently loaded model
+                state.model = None
+                state.tokenizer = None
+                gc.collect()
+                try:
+                    mx.clear_cache()
+                except AttributeError:
+                    pass
+
+                # Load target model
+                state.model_name = model_id
+                t_load = time.monotonic()
+                state.model, state.tokenizer = load(model_id)
+                mx.synchronize()
+                load_time = time.monotonic() - t_load
+
+                # Profile: generate tokens and measure
+                mem_before = get_memory_state()
+                t0 = time.monotonic()
+                output = generate(
+                    state.model,
+                    state.tokenizer,
+                    prompt=prompt_text,
+                    max_tokens=max_tokens,
+                    verbose=False,
+                )
+                mx.synchronize()
+                elapsed = time.monotonic() - t0
+                out_tokens = len(state.tokenizer.encode(output))
+                mem_after = get_memory_state()
+
+                result["tokens_per_sec"] = round(out_tokens / elapsed, 1) if elapsed > 0 else 0
+                result["memory_gb"] = round(mem_before.available_gb - mem_after.available_gb, 2)
+                result["load_time_s"] = round(load_time, 2)
+
+            except Exception as e:
+                result["error"] = str(e)
+
+            results.append(result)
+
+        # Restore original model name (leave model unloaded to save memory)
+        state.model = None
+        state.tokenizer = None
+        state.prompt_reuse.clear()
+        gc.collect()
+        try:
+            mx.clear_cache()
+        except AttributeError:
+            pass
+        state.model_name = original_model
+
+        self._send_json(results)
+
+    def _handle_chat(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._send_json({"error": "Invalid JSON"}, 400)
+            return
+
+        if not isinstance(data, dict):
+            self._send_json({"error": "Expected a JSON object"}, 400)
+            return
+        try:
+            options = validate_chat_template_kwargs(data.get("chat_template_kwargs", {}))
+        except ValueError as error:
+            self._send_json({"error": str(error)}, 400)
+            return
+        state = self.server_state
+        try:
+            with state.chat_lock:
+                if options and not state.capabilities()["thinking_control"]:
+                    self._send_json({"error": "Selected model does not support a thinking toggle"}, 400)
+                    return
+                if options and state.batching:
+                    self._send_json(
+                        {"error": "Request thinking profiles are unsupported with continuous batching"}, 400
+                    )
+                    return
+                use_batch = state.batching and state.engine is not None
+                if not use_batch:
+                    with chat_template_profile(options):
+                        self._handle_chat_data(data, use_batch=False)
+                    return
+            # Preserve worker concurrency with a dispatch mode captured under
+            # the same lock as configuration changes. Batch workers do not
+            # inherit request profiles.
+            self._handle_chat_data(data, use_batch=True)
+        except ChatTemplateProfileError as error:
+            self._send_json({"error": str(error)}, 400)
+
+    def _handle_chat_data(self, data, *, use_batch=False):
+        messages = data.get("messages", [])
+        max_tokens = data.get("max_tokens", 256)
+        temperature = data.get("temperature", 0.7)
+        top_p = data.get("top_p", 1.0)
+        top_k = data.get("top_k", 0)
+        supported = {
+            "model",
+            "messages",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "stream",
+            "stream_options",
+            "chat_template_kwargs",
+            "cache_scope",
+            "repetition_penalty",
+        }
+        if set(data) - supported:
+            self._send_json({"error": "Unsupported request fields: " + ", ".join(sorted(set(data) - supported))}, 400)
+            return
+        cache_scope = data.get("cache_scope", "default")
+        if not isinstance(cache_scope, str) or not cache_scope or len(cache_scope) > 128:
+            self._send_json({"error": "cache_scope must be a nonempty string of at most 128 characters"}, 400)
+            return
+        if use_batch and "cache_scope" in data:
+            self._send_json({"error": "Session-scoped prompt reuse is unsupported with continuous batching"}, 400)
+            return
+        penalty = data.get("repetition_penalty")
+        if penalty is not None and (type(penalty) not in (int, float) or not math.isfinite(penalty) or penalty <= 0):
+            self._send_json({"error": "repetition_penalty must be a positive finite number"}, 400)
+            return
+        if penalty is not None and (use_batch or self.server_state.speculative != "none"):
+            self._send_json({"error": "repetition_penalty requires standard unbatched generation"}, 400)
+            return
+        if (
+            type(max_tokens) is not int
+            or max_tokens < 1
+            or type(top_k) is not int
+            or top_k < 0
+            or type(temperature) not in (int, float)
+            or not math.isfinite(temperature)
+            or temperature < 0
+            or type(top_p) not in (int, float)
+            or not math.isfinite(top_p)
+            or not 0 < top_p <= 1
+            or type(data.get("stream", False)) is not bool
+        ):
+            self._send_json({"error": "Invalid max_tokens, sampling or stream options"}, 400)
+            return
+        stream_options = data.get("stream_options", {})
+        if (
+            not isinstance(stream_options, dict)
+            or set(stream_options) - {"include_usage"}
+            or type(stream_options.get("include_usage", False)) is not bool
+        ):
+            self._send_json({"error": "Unsupported stream_options"}, 400)
+            return
+
+        if not messages:
+            self._send_json({"error": "No messages provided"}, 400)
+            return
+
+        stream = data.get("stream", False)
+        state = self.server_state
+        if (
+            not use_batch
+            and (state.spec_engine is not None or state.speculative != "none")
+            and (temperature != 0 or top_p != 1.0 or top_k != 0)
+        ):
+            self._send_json(
+                {"error": "Speculative engines support only greedy temperature=0 without top_p/top_k filters"}, 400
+            )
+            return
+
+        # Route through continuous batching engine when enabled
+        if use_batch:
+            if top_p != 1.0 or top_k != 0:
+                self._send_json({"error": "Continuous batching does not support top_p/top_k filters"}, 400)
+                return
+            if stream:
+                self._handle_stream_batched(
+                    messages, max_tokens, temperature, include_usage=stream_options.get("include_usage", False)
+                )
+            else:
+                self._handle_chat_batched(messages, max_tokens, temperature)
+            return
+
+        if stream:
+            self._handle_stream(
+                messages,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                include_usage=stream_options.get("include_usage", False),
+                cache_scope=cache_scope,
+                repetition_penalty=penalty,
+            )
+            return
+
+        sampling = {key: data[key] for key in ("top_p", "top_k", "repetition_penalty") if key in data}
+        if "cache_scope" in data:
+            sampling["cache_scope"] = cache_scope
+        result = state.generate(messages, max_tokens, temperature, **sampling)
+
+        if "error" in result:
+            self._send_json({"error": result["error"]}, 503)
+            return
+
+        # Format as OpenAI-compatible response
+        response = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "local",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": result["output"],
+                    },
+                    "finish_reason": result.get("finish_reason"),
+                }
+            ],
+            "usage": {
+                "prompt_tokens": result.get("prompt_tokens"),
+                "completion_tokens": result["tokens"],
+                "total_tokens": result["tokens"] + result["prompt_tokens"]
+                if result.get("prompt_tokens") is not None
+                else None,
+            },
+            "mlx_flash_compress": {
+                "tok_per_s": result["tok_per_s"],
+                "memory_pressure": result["memory_pressure"],
+                "speculative_engine": state.speculative,
+                "generation_tps": result.get("generation_tps"),
+                "prompt_tps": result.get("prompt_tps"),
+                "ttft_ms": result.get("ttft_ms"),
+                "peak_memory_gb": result.get("peak_memory_gb"),
+                "native_generation_metadata": result.get("native_generation_metadata", False),
+                "usage_source": result.get("usage_source", "unknown"),
+                "cached_prompt_tokens": result.get("cached_prompt_tokens"),
+                "processed_prompt_tokens": result.get("processed_prompt_tokens"),
+            },
+        }
+        if "speculative_stats" in result:
+            response["mlx_flash_compress"]["speculative_stats"] = result["speculative_stats"]
+        self._send_json(response)
+
+    def _handle_stream(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        top_p=1.0,
+        top_k=0,
+        *,
+        include_usage=False,
+        cache_scope="default",
+        repetition_penalty=None,
+    ):
+        """Send an explicitly buffered SSE response using the native result."""
+        state = self.server_state
+        sampling = {"repetition_penalty": repetition_penalty} if repetition_penalty is not None else {}
+        result = state.generate(
+            messages, max_tokens, temperature, top_p=top_p, top_k=top_k, cache_scope=cache_scope, **sampling
+        )
+        if "error" in result:
+            self._send_json({"error": result["error"]}, 503)
+            return
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-MLX-Generation", "buffered; chunks are not live model tokens")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        event = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "local",
+            "choices": [
+                {"index": 0, "delta": {"role": "assistant", "content": result["output"]}, "finish_reason": None}
+            ],
+        }
+        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+        final = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "local",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": result.get("finish_reason")}],
+            "mlx_flash_compress": {
+                "native_generation_metadata": result.get("native_generation_metadata", False),
+                "usage_source": result.get("usage_source", "unknown"),
+                "cached_prompt_tokens": result.get("cached_prompt_tokens"),
+                "processed_prompt_tokens": result.get("processed_prompt_tokens"),
+            },
+        }
+        if include_usage:
+            prompt_tokens = result.get("prompt_tokens")
+            final["usage"] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": result["tokens"],
+                "total_tokens": prompt_tokens + result["tokens"] if prompt_tokens is not None else None,
+            }
+        self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def _handle_chat_batched(self, messages, max_tokens, temperature):
+        """Handle non-streaming chat via continuous batching engine."""
+        state = self.server_state
+        if state.model is None:
+            state.load_model()
+
+        prompt = state._format_messages(messages)
+        t0 = time.monotonic()
+
+        req = state.engine.submit(prompt, max_tokens=max_tokens, temperature=temperature)
+        result = state.engine.wait_for_completion(req, timeout=60.0)
+
+        elapsed = time.monotonic() - t0
+
+        from mlx_flash_compress.continuous_batching import RequestStatus
+
+        if result.status != RequestStatus.COMPLETED:
+            self._send_json({"error": "Request timed out or was cancelled"}, 503)
+            return
+
+        output = state.tokenizer.decode(result.generated_tokens)
+        tokens = len(result.generated_tokens)
+        tps = tokens / elapsed if elapsed > 0 else 0
+
+        with state.chat_lock:
+            state.total_requests += 1
+            state.total_tokens += tokens
+            state.last_generation = {
+                "prompt_tokens": len(req.prompt_tokens),
+                "generation_tokens": tokens,
+                "finish_reason": result.finish_reason,
+                "time_s": elapsed,
+                "ttft_ms": result.ttft_ms if result.first_token_at > 0 else None,
+                "generation_tps": result.tokens_per_second if result.first_token_at > 0 else None,
+                "prompt_tps": None,
+                "peak_memory_gb": None,
+                "native_generation_metadata": False,
+                "usage_source": "exact_batch_tokens",
+            }
+
+        response = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "local",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": output,
+                    },
+                    "finish_reason": result.finish_reason,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(req.prompt_tokens),
+                "completion_tokens": tokens,
+                "total_tokens": len(req.prompt_tokens) + tokens,
+            },
+            "mlx_flash_compress": {
+                "tok_per_s": round(tps, 1),
+                "batched": True,
+                "native_generation_metadata": False,
+                "usage_source": "exact_batch_tokens",
+            },
+        }
+        self._send_json(response)
+
+    def _handle_stream_batched(self, messages, max_tokens, temperature, *, include_usage=False):
+        """Handle streaming (SSE) response via continuous batching engine."""
+        state = self.server_state
+        if state.model is None:
+            state.load_model()
+
+        prompt = state._format_messages(messages)
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+
+        req = state.engine.submit(prompt, max_tokens=max_tokens, temperature=temperature)
+
+        # Start SSE response
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        token_count = 0
+        for token_id in state.engine.stream_tokens(req):
+            chunk_text = state.tokenizer.decode([token_id])
+            token_count += 1
+            event = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "local",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": chunk_text},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+            self.wfile.flush()
+
+        # Final chunk with finish_reason
+        final = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "local",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": req.finish_reason}],
+            "mlx_flash_compress": {"native_generation_metadata": False, "usage_source": "exact_batch_tokens"},
+        }
+        if include_usage:
+            final["usage"] = {
+                "prompt_tokens": len(req.prompt_tokens),
+                "completion_tokens": len(req.generated_tokens),
+                "total_tokens": len(req.prompt_tokens) + len(req.generated_tokens),
+            }
+        self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        from mlx_flash_compress.continuous_batching import RequestStatus
+
+        if req.status == RequestStatus.COMPLETED:
+            with state.chat_lock:
+                state.total_requests += 1
+                state.total_tokens += len(req.generated_tokens)
+                state.last_generation = {
+                    "prompt_tokens": len(req.prompt_tokens),
+                    "generation_tokens": len(req.generated_tokens),
+                    "finish_reason": req.finish_reason,
+                    "time_s": req.completed_at - req.created_at,
+                    "ttft_ms": req.ttft_ms if req.first_token_at > 0 else None,
+                    "generation_tps": req.tokens_per_second if req.first_token_at > 0 else None,
+                    "prompt_tps": None,
+                    "peak_memory_gb": None,
+                    "native_generation_metadata": False,
+                    "usage_source": "exact_batch_tokens",
+                }
+
+    def _serve_chat_html(self):
+        """Serve the web chat UI — loads from the shared HTML file."""
+        import pathlib
+
+        chat_html_path = pathlib.Path(__file__).parent.parent / "assets" / "chat.html"
+        if chat_html_path.exists():
+            html = chat_html_path.read_text()
+        else:
+            html = self._fallback_chat_html()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(html.encode())
+
+    @staticmethod
+    def _fallback_chat_html():
+        return """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>MLX-Flash Chat</title></head>
+<body style="background:#0a0e14;color:#d4dce8;font-family:system-ui;max-width:700px;margin:40px auto;padding:0 20px">
+<h1 style="background:linear-gradient(135deg,#4da6ff,#7b61ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">MLX-Flash Chat</h1>
+<p style="color:#5c6a7a">assets/chat.html not found — using fallback UI</p>
+<div id="msgs"></div>
+<div style="display:flex;gap:8px;margin-top:20px">
+<input id="inp" style="flex:1;background:#131920;border:1px solid #262d38;border-radius:8px;padding:10px;color:#d4dce8;font-size:14px" placeholder="Type a message..." autofocus>
+<button onclick="send()" style="background:linear-gradient(135deg,#4da6ff,#7b61ff);border:none;color:#fff;padding:10px 20px;border-radius:8px;cursor:pointer">Send</button>
+</div>
+<script>
+const msgs=[],msgsEl=document.getElementById('msgs'),inp=document.getElementById('inp');
+inp.addEventListener('keydown',e=>{if(e.key==='Enter')send()});
+async function send(){
+  const t=inp.value.trim();if(!t)return;inp.value='';
+  msgs.push({role:'user',content:t});
+  msgsEl.innerHTML+=`<p><b style="color:#4da6ff">You:</b> ${t}</p>`;
+  const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'local',messages:msgs,max_tokens:512})});
+  const j=await r.json();
+  const reply=j.choices?.[0]?.message?.content||j.error||'No response';
+  msgs.push({role:'assistant',content:reply});
+  msgsEl.innerHTML+=`<p><b style="color:#7b61ff">AI:</b> ${reply}</p>`;
+}
+</script></body></html>"""
+
+    def _serve_metrics(self):
+        """Serve Prometheus exposition format metrics."""
+        state = self.server_state
+        mem = get_memory_state()
+        uptime = time.monotonic() - state.start_time
+
+        lines = []
+        lines.append("# HELP mlx_flash_info Server metadata.")
+        lines.append("# TYPE mlx_flash_info gauge")
+        lines.append(f'mlx_flash_info{{model="{state.model_name}"}} 1')
+        lines.append("")
+        lines.append("# HELP mlx_flash_uptime_seconds Time since server start.")
+        lines.append("# TYPE mlx_flash_uptime_seconds gauge")
+        lines.append(f"mlx_flash_uptime_seconds {uptime:.1f}")
+        lines.append("")
+        lines.append("# HELP mlx_flash_requests_total Total inference requests.")
+        lines.append("# TYPE mlx_flash_requests_total counter")
+        lines.append(f"mlx_flash_requests_total {state.total_requests}")
+        lines.append("")
+        lines.append("# HELP mlx_flash_tokens_generated_total Total tokens generated.")
+        lines.append("# TYPE mlx_flash_tokens_generated_total counter")
+        lines.append(f"mlx_flash_tokens_generated_total {state.total_tokens}")
+        lines.append("")
+        # Memory
+        total_b = mem.total_gb * 1073741824
+        free_b = mem.free_gb * 1073741824
+        available_b = mem.available_gb * 1073741824
+        swap_b = mem.swap_used_gb * 1073741824
+        used_ratio = (1.0 - mem.available_gb / mem.total_gb) if mem.total_gb > 0 else 0
+        pressure_map = {"normal": 0, "warning": 1, "critical": 2}
+        pressure_val = pressure_map.get(mem.pressure_level, 0)
+
+        lines.append("# HELP mlx_flash_memory_total_bytes Total physical RAM.")
+        lines.append("# TYPE mlx_flash_memory_total_bytes gauge")
+        lines.append(f"mlx_flash_memory_total_bytes {total_b:.0f}")
+        lines.append("")
+        lines.append("# HELP mlx_flash_memory_free_bytes Free (unused) RAM.")
+        lines.append("# TYPE mlx_flash_memory_free_bytes gauge")
+        lines.append(f"mlx_flash_memory_free_bytes {free_b:.0f}")
+        lines.append("")
+        lines.append("# HELP mlx_flash_memory_available_bytes Usable RAM (free + inactive).")
+        lines.append("# TYPE mlx_flash_memory_available_bytes gauge")
+        lines.append(f"mlx_flash_memory_available_bytes {available_b:.0f}")
+        lines.append("")
+        lines.append("# HELP mlx_flash_memory_swap_used_bytes Swap space in use.")
+        lines.append("# TYPE mlx_flash_memory_swap_used_bytes gauge")
+        lines.append(f"mlx_flash_memory_swap_used_bytes {swap_b:.0f}")
+        lines.append("")
+        lines.append("# HELP mlx_flash_memory_used_ratio Fraction of RAM in use (0-1).")
+        lines.append("# TYPE mlx_flash_memory_used_ratio gauge")
+        lines.append(f"mlx_flash_memory_used_ratio {used_ratio:.4f}")
+        lines.append("")
+        lines.append("# HELP mlx_flash_memory_pressure macOS memory pressure (0=normal, 1=warning, 2=critical).")
+        lines.append("# TYPE mlx_flash_memory_pressure gauge")
+        lines.append(f"mlx_flash_memory_pressure {pressure_val}")
+        lines.append("")
+        # Model loaded
+        loaded = 1 if state.model is not None else 0
+        lines.append("# HELP mlx_flash_model_loaded Whether a model is loaded (1) or not (0).")
+        lines.append("# TYPE mlx_flash_model_loaded gauge")
+        lines.append(f"mlx_flash_model_loaded {loaded}")
+        lines.append("")
+
+        body = "\n".join(lines) + "\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def _serve_dashboard_html(self):
+        """Serve the admin dashboard — loads from assets/dashboard.html or inline fallback."""
+        import pathlib
+
+        dash_path = pathlib.Path(__file__).parent.parent / "assets" / "dashboard.html"
+        if dash_path.exists():
+            html = dash_path.read_text()
+        else:
+            html = self._fallback_dashboard_html()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(html.encode())
+
+    @staticmethod
+    def _fallback_dashboard_html():
+        return """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>MLX-Flash Dashboard</title></head>
+<body style="background:#0a0e14;color:#d4dce8;font-family:system-ui;max-width:900px;margin:40px auto;padding:0 20px">
+<h1 style="background:linear-gradient(135deg,#4da6ff,#7b61ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">MLX-Flash Dashboard</h1>
+<p style="color:#5c6a7a">assets/dashboard.html not found — using fallback</p>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-top:24px">
+<div id="model-card" style="background:#1a2029;border:1px solid #262d38;border-radius:12px;padding:18px"><div style="color:#5c6a7a;font-size:0.75rem;text-transform:uppercase">Model</div><div id="model" style="font-size:1.1rem;font-weight:600;margin-top:8px">loading...</div></div>
+<div style="background:#1a2029;border:1px solid #262d38;border-radius:12px;padding:18px"><div style="color:#5c6a7a;font-size:0.75rem;text-transform:uppercase">Memory</div><div id="mem" style="font-size:1.8rem;font-weight:700;margin-top:8px;color:#2dd4a8">--%</div></div>
+<div style="background:#1a2029;border:1px solid #262d38;border-radius:12px;padding:18px"><div style="color:#5c6a7a;font-size:0.75rem;text-transform:uppercase">Tokens</div><div id="tok" style="font-size:1.8rem;font-weight:700;margin-top:8px;color:#4da6ff">0</div></div>
+</div>
+<div style="margin-top:16px;background:#1a2029;border:1px solid #262d38;border-radius:12px;padding:18px">
+<div style="color:#5c6a7a;font-size:0.75rem;text-transform:uppercase;margin-bottom:12px">Memory Chart</div>
+<canvas id="mem-chart" style="width:100%;height:150px"></canvas>
+</div>
+<div style="margin-top:12px;text-align:center"><a href="/chat" style="color:#4da6ff;text-decoration:none;font-size:0.85rem">Open Chat UI &rarr;</a></div>
+<script>
+const MAX=60;let memH=[];
+function draw(c,d,col){const dpr=devicePixelRatio||1,r=c.getBoundingClientRect();c.width=r.width*dpr;c.height=r.height*dpr;const x=c.getContext('2d');x.scale(dpr,dpr);const w=r.width,h=r.height;x.clearRect(0,0,w,h);if(d.length<2)return;const mx=Math.max(...d,1)*1.15;const p=d.map((v,i)=>[i/(MAX-1)*w,h-(v/mx)*(h-30)-4]);x.beginPath();x.strokeStyle=col;x.lineWidth=2;p.forEach((pt,i)=>i?x.lineTo(pt[0],pt[1]):x.moveTo(pt[0],pt[1]));x.stroke()}
+async function poll(){try{const s=await fetch('/status').then(r=>r.json()),m=s.memory||{},st=s.stats||{};document.getElementById('model').textContent=(s.model||'none').split('/').pop();const a=Math.max((m.free_gb||0)+(m.inactive_gb||0)*0.5,0),t=m.total_gb||1,p=((1-a/t)*100);document.getElementById('mem').textContent=p.toFixed(0)+'%';document.getElementById('tok').textContent=(st.tokens_generated||0).toLocaleString();memH.push(p);if(memH.length>MAX)memH.shift();draw(document.getElementById('mem-chart'),memH,'#4da6ff')}catch(e){}}
+poll();setInterval(poll,2000);
+</script></body></html>"""
+
+    def _handle_telemetry(self):
+        """Return current telemetry sample plus 120-sample history."""
+        state = self.server_state
+        stats = state.telemetry.get_stats()
+        history = state.telemetry.get_history(seconds=120)
+        self._send_json(
+            {
+                "current": stats.get("current", {}),
+                "stats": {
+                    "samples_count": stats.get("samples_count", 0),
+                    "avg": stats.get("avg", {}),
+                    "max": stats.get("max", {}),
+                    "min": stats.get("min", {}),
+                },
+                "history": history,
+            }
+        )
+
+    def _handle_telemetry_current(self):
+        """Return just the current telemetry sample."""
+        state = self.server_state
+        sample = state.telemetry.sample()
+        self._send_json(sample.to_dict())
+
+    def _send_json(self, data: dict, status: int = 200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data, indent=2).encode())
+
+    def do_OPTIONS(self):
+        """Handle CORS preflight."""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        """Route HTTP access logs through structured logger."""
+        log = logger or __import__("logging").getLogger("mlx_flash")
+        msg = format % args
+        if "POST" in msg:
+            log.info(msg, extra={"action": "http_request"})
+        elif "error" in msg.lower() or "404" in msg or "500" in msg:
+            log.warning(msg, extra={"action": "http_error"})
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MLX-Flash: Memory-aware inference server")
+    parser.add_argument("--model", default=None, help="MLX model to serve (auto-selects based on RAM if not specified)")
+    parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
+    parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
+    parser.add_argument("--preload", action="store_true", help="Load model immediately")
+    parser.add_argument(
+        "--prompt-cache-bytes",
+        type=int,
+        default=512 * 1024 * 1024,
+        help="Maximum retained native prompt state bytes; 0 disables reuse (default 512 MiB)",
+    )
+    parser.add_argument("--prompt-cache-entries", type=int, default=8, help="Maximum prompt snapshots (default 8)")
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=0,
+        choices=[0, 4, 8],
+        help="KV cache quantization bits (0=none, 8=45%% memory savings)",
+    )
+    parser.add_argument(
+        "--log-format", default="text", choices=["text", "json"], help="Log format: text (human) or json (structured)"
+    )
+    parser.add_argument("--log-file", default=None, help="Log file path (also logs to stdout)")
+    parser.add_argument(
+        "--batching",
+        action="store_true",
+        help="Enable continuous batching engine for concurrent request handling",
+    )
+    parser.add_argument(
+        "--speculative",
+        default="none",
+        choices=list(SPECULATIVE_ENGINES),
+        help="Speculative decoding engine (default: none)",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=120.0,
+        help="Request timeout in seconds (default: 120)",
+    )
+    parser.add_argument(
+        "--cache-budget-pct",
+        type=float,
+        default=0.8,
+        help="Cache budget as fraction of available memory (default: 0.8)",
+    )
+    parser.add_argument(
+        "--safety-margin-gb",
+        type=float,
+        default=2.0,
+        help="Safety margin in GB for memory management (default: 2.0)",
+    )
+    args = parser.parse_args()
+
+    # Initialize structured logging
+    global logger
+    logger = setup_logging(
+        component="python-worker",
+        port=args.port,
+        json_format=(args.log_format == "json"),
+        log_file=args.log_file,
+    )
+
+    # Auto-select model based on available RAM
+    if args.model is None:
+        mem = get_memory_state()
+        ram = mem.total_gb
+        if ram >= 32:
+            args.model = "mlx-community/Qwen3-30B-A3B-4bit"  # 30B MoE, ~18GB
+        elif ram >= 16:
+            args.model = "mlx-community/Qwen3-30B-A3B-4bit"  # fits with streaming
+        elif ram >= 12:
+            args.model = "mlx-community/Qwen3-8B-4bit"  # 8B dense, ~5GB
+        else:
+            args.model = "mlx-community/Qwen3-4B-4bit"  # 4B dense, ~2.5GB
+
+    state = InferenceState(
+        args.model,
+        cache_budget_pct=args.cache_budget_pct,
+        kv_bits=args.kv_bits,
+        batching=args.batching,
+        speculative=args.speculative,
+        request_timeout=args.request_timeout,
+        safety_margin_gb=args.safety_margin_gb,
+        prompt_cache_bytes=args.prompt_cache_bytes,
+        prompt_cache_entries=args.prompt_cache_entries,
+    )
+
+    logger.info(
+        "MLX-Flash inference server starting",
+        extra={
+            "model": args.model,
+            "port": args.port,
+            "speculative": args.speculative,
+        },
+    )
+
+    mem = get_memory_state()
+    logger.info(
+        "Hardware detected",
+        extra={
+            "memory_gb": round(mem.available_gb, 1),
+            "pressure": mem.pressure_level,
+        },
+    )
+
+    if args.preload:
+        state.load_model()
+
+    ChatHandler.server_state = state
+
+    # Start hardware telemetry sampling
+    state.telemetry.start_sampling(interval_ms=1000)
+    logger.info("Hardware telemetry started", extra={"action": "telemetry_start", "interval_ms": 1000})
+
+    server = ThreadedHTTPServer((args.host, args.port), ChatHandler)
+    logger.info(
+        "Server listening",
+        extra={
+            "port": args.port,
+            "action": "server_start",
+            "model": args.model,
+        },
+    )
+
+    def _graceful_shutdown(signum, frame):
+        sig_name = signal.Signals(signum).name
+        logger.info(
+            f"Received {sig_name}, shutting down gracefully", extra={"action": "server_stop", "signal": sig_name}
+        )
+        state.telemetry.stop_sampling()
+        server.shutdown()
+
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down", extra={"action": "server_stop"})
+        state.telemetry.stop_sampling()
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()

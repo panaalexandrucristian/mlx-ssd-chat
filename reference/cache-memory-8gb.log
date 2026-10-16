@@ -1,0 +1,7 @@
+Memory budgets: MLX 8 GB; process 9.2 GB
+Expert cache: 49/128 per layer; resident weights ~7.11 GB; MLX working reserve 0.80 GB
+Load: 4.78s; MLX 7.11 GB; process peak RSS=0.70 GB; peak physical footprint=7.18 GB
+Prompt: 26 tokens
+4
+TTFT=11.13s; total=11.68s; generated=2; decode=3.66 tok/s; MLX peak=7.36 GB
+process peak RSS=0.70 GB; peak physical footprint=7.92 GB

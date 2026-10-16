@@ -1,0 +1,637 @@
+//! Web dashboard served at /admin with live charts, worker pool, memory breakdown, and logs.
+
+use axum::response::Html;
+
+pub async fn serve_dashboard() -> Html<&'static str> {
+    Html(DASHBOARD_HTML)
+}
+
+const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MLX-Flash Dashboard</title>
+<style>
+  :root {
+    --bg: #0a0e14; --surface: #131920; --card: #1a2029; --border: #262d38;
+    --text: #d4dce8; --dim: #5c6a7a; --accent: #4da6ff; --accent2: #7b61ff;
+    --green: #2dd4a8; --yellow: #fbbf24; --red: #ef4444; --orange: #f97316;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+  .header { padding: 24px 32px 16px; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid var(--border); }
+  .header h1 { font-size: 1.4rem; font-weight: 600; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .header .status { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--dim); }
+  .header .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .header .nav { display: flex; gap: 8px; flex-wrap: wrap; }
+  .header .nav a { color: var(--dim); text-decoration: none; font-size: 0.8rem; padding: 4px 10px; border-radius: 6px; transition: all 0.15s; }
+  .header .nav a:hover { color: var(--text); background: rgba(77,166,255,0.1); }
+  .header .nav a.nav-active { background: rgba(77,166,255,0.15); color: var(--accent); }
+  .header .uptime { margin-left: auto; font-size: 0.8rem; color: var(--dim); font-variant-numeric: tabular-nums; }
+
+  .container { padding: 20px 32px; }
+  .grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px; margin-bottom: 14px; }
+
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; transition: border-color 0.2s; }
+  .card:hover { border-color: var(--accent); }
+  .card-label { font-size: 0.7rem; font-weight: 500; color: var(--dim); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 10px; }
+  .card-value { font-size: 2rem; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+  .card-sub { font-size: 0.75rem; color: var(--dim); margin-top: 6px; }
+  .card-sm { font-size: 1.1rem; font-weight: 600; }
+
+  .span2 { grid-column: span 2; }
+  .span3 { grid-column: span 3; }
+  .span6 { grid-column: span 6; }
+
+  .bar { height: 6px; background: var(--border); border-radius: 3px; margin-top: 10px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width 0.6s cubic-bezier(0.16,1,0.3,1); }
+
+  .green { color: var(--green); } .yellow { color: var(--yellow); } .red { color: var(--red); } .accent { color: var(--accent); }
+  .bg-green { background: var(--green); } .bg-yellow { background: var(--yellow); } .bg-red { background: var(--red); } .bg-accent { background: var(--accent); }
+
+  .chart-wrap { position: relative; height: 160px; }
+  .chart-wrap canvas { position: absolute; top: 0; left: 0; width: 100% !important; height: 100% !important; }
+  .chart-label { position: absolute; top: 8px; left: 12px; font-size: 0.7rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.8px; z-index: 1; }
+  .chart-value { position: absolute; top: 22px; left: 12px; font-size: 1.3rem; font-weight: 700; z-index: 1; font-variant-numeric: tabular-nums; }
+
+  .hints { display: flex; flex-direction: column; gap: 8px; }
+  .hint { display: flex; align-items: flex-start; gap: 10px; padding: 10px 14px; border-radius: 10px; font-size: 0.82rem; line-height: 1.4; }
+  .hint-critical { background: rgba(239,68,68,0.08); border-left: 3px solid var(--red); }
+  .hint-warning { background: rgba(251,191,36,0.08); border-left: 3px solid var(--yellow); }
+  .hint-info { background: rgba(77,166,255,0.08); border-left: 3px solid var(--accent); }
+  .hint-icon { font-size: 1rem; flex-shrink: 0; margin-top: 1px; }
+
+  .badge-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .badge { padding: 3px 10px; border-radius: 6px; font-size: 0.7rem; font-weight: 500; background: var(--border); }
+  .badge-active { background: rgba(45,212,168,0.12); color: var(--green); border: 1px solid rgba(45,212,168,0.2); }
+  .badge-warning { background: rgba(239,68,68,0.12); color: var(--red); border: 1px solid rgba(239,68,68,0.2); }
+
+  .worker-row { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.82rem; }
+  .worker-row:last-child { border-bottom: none; }
+  .worker-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+  .log-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; max-height: 280px; overflow-y: auto; font-family: 'SF Mono', Menlo, monospace; font-size: 0.75rem; line-height: 1.6; }
+  .log-panel::-webkit-scrollbar { width: 6px; } .log-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .log-line { padding: 2px 12px; border-bottom: 1px solid rgba(38,45,56,0.3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .log-line:hover { background: rgba(77,166,255,0.05); white-space: normal; }
+  .log-info { color: var(--accent); } .log-warn { color: var(--yellow); } .log-error { color: var(--red); } .log-debug { color: var(--dim); }
+
+  .btn { padding: 4px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 0.72rem; cursor: pointer; transition: all 0.15s; font-family: inherit; }
+  .btn:hover { border-color: var(--accent); background: rgba(77,166,255,0.1); }
+  .btn-danger { border-color: var(--red); color: var(--red); }
+  .btn-danger:hover { background: rgba(239,68,68,0.1); }
+  .btn-sm { padding: 2px 8px; font-size: 0.68rem; }
+  .action-bar { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+
+  .mem-breakdown { display: flex; gap: 4px; height: 20px; border-radius: 6px; overflow: hidden; margin-top: 8px; }
+  .mem-seg { height: 100%; transition: width 0.6s; position: relative; }
+  .mem-seg:hover::after { content: attr(data-label); position: absolute; top: -24px; left: 50%; transform: translateX(-50%); font-size: 0.65rem; color: var(--text); background: var(--card); padding: 2px 6px; border-radius: 4px; white-space: nowrap; border: 1px solid var(--border); }
+
+  @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } .span2,.span3,.span6 { grid-column: span 2; } }
+  @media (max-width: 500px) { .grid { grid-template-columns: 1fr; } .span2,.span3,.span6 { grid-column: span 1; } .container { padding: 12px 16px; } }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>MLX-Flash</h1>
+  <div class="status"><div class="dot"></div> Live</div>
+  <div class="nav">
+    <a href="/admin" class="nav-active">Dashboard</a>
+    <a href="/chat">Chat</a>
+    <a href="/metrics">Prometheus</a>
+    <a href="/status" target="_blank">Status JSON</a>
+    <a href="/gpu" target="_blank">GPU</a>
+    <a href="/telemetry" target="_blank">Telemetry</a>
+    <a href="/cache/stats" target="_blank">Cache</a>
+    <a href="/workers" target="_blank">Workers</a>
+    <a href="/v1/models/registry" target="_blank">Models</a>
+    <a href="/logs/recent" target="_blank">Logs JSON</a>
+  </div>
+  <div class="uptime" id="uptime">0:00</div>
+</div>
+
+<div class="container">
+<div class="grid">
+
+  <!-- Row 1: Key stats -->
+  <div class="card">
+    <div class="card-label">Model</div>
+    <div class="card-sm" id="model">loading...</div>
+    <div class="card-sub" id="model-sub"></div>
+  </div>
+  <div class="card">
+    <div class="card-label">Memory</div>
+    <div class="card-value" id="mem-pct"><span class="green">--%</span></div>
+    <div class="bar"><div class="bar-fill bg-green" id="mem-bar" style="width:0%"></div></div>
+    <div class="card-sub"><span id="mem-avail">--</span> / <span id="mem-total">--</span> GB</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Requests</div>
+    <div class="card-value accent" id="requests">0</div>
+    <div class="card-sub"><span id="req-rate">0</span> req/s</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Tokens</div>
+    <div class="card-value" id="tokens"><span class="accent">0</span></div>
+    <div class="card-sub"><span id="tok-rate">0</span> tok/s</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Saved vs Cloud</div>
+    <div class="card-value" id="savings"><span class="green">$0</span></div>
+    <div class="card-sub">vs Claude Sonnet API ($15/1M tok)</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Pressure</div>
+    <div class="card-value" id="pressure"><span class="green">OK</span></div>
+    <div class="card-sub">Swap: <span id="swap">0</span> GB</div>
+  </div>
+
+  <!-- Row 2: Charts -->
+  <div class="card span3">
+    <div class="chart-wrap">
+      <div class="chart-label">Memory Usage</div>
+      <div class="chart-value accent" id="mem-chart-val">--%</div>
+      <canvas id="mem-chart"></canvas>
+    </div>
+  </div>
+  <div class="card span3">
+    <div class="chart-wrap">
+      <div class="chart-label">Tokens / sec</div>
+      <div class="chart-value green" id="tps-chart-val">0</div>
+      <canvas id="tps-chart"></canvas>
+    </div>
+  </div>
+
+  <!-- Row 3: Memory breakdown + Workers -->
+  <div class="card span3">
+    <div class="card-label">Memory Breakdown</div>
+    <div class="mem-breakdown" id="mem-breakdown"></div>
+    <div class="card-sub" style="margin-top:10px">
+      <span style="color:var(--red)">&#9632;</span> Active
+      <span style="color:var(--orange)">&#9632;</span> Wired
+      <span style="color:var(--yellow)">&#9632;</span> Compressed
+      <span style="color:var(--dim)">&#9632;</span> Inactive
+      <span style="color:var(--green)">&#9632;</span> Free
+    </div>
+    <div class="card-sub" id="mem-detail"></div>
+  </div>
+  <div class="card span3">
+    <div class="card-label">Workers <span id="worker-summary" style="float:right;color:var(--green)"></span></div>
+    <div id="workers"></div>
+    <div class="card-sub" style="margin-top:8px">
+      Sessions: <span id="sessions">0</span> | Strategy: <span id="worker-strategy">least-connections + cache-affinity</span>
+    </div>
+    <div class="card-sub" style="margin-top:4px" id="worker-sessions-detail"></div>
+    <div class="action-bar">
+      <button class="btn" onclick="apiAction('/reload','POST')">Reload All</button>
+      <button class="btn" onclick="apiAction('/workers/restart','POST')">Restart Unhealthy</button>
+      <button class="btn btn-danger" onclick="if(confirm('Shutdown server?'))apiAction('/shutdown','POST')">Shutdown</button>
+    </div>
+  </div>
+
+  <!-- Row 4: GPU + Hints + Cache -->
+  <div class="card span2">
+    <div class="card-label">GPU (Metal) + Telemetry</div>
+    <div class="card-value" id="gpu-util"><span class="accent">--%</span></div>
+    <div class="bar"><div class="bar-fill bg-accent" id="gpu-bar" style="width:0%"></div></div>
+    <div class="card-sub"><span id="gpu-mem">--</span> GB used</div>
+    <div class="card-sub" style="margin-top:4px"><span id="gpu-renderer">--</span>% renderer / <span id="gpu-tiler">--</span>% tiler</div>
+    <div class="card-sub" style="margin-top:6px;border-top:1px solid var(--border);padding-top:6px">
+      Power: <span id="gpu-power" class="yellow">--</span> W | ANE: <span id="gpu-ane" class="accent">--%</span>
+    </div>
+    <div class="card-sub" style="margin-top:4px">
+      CPU Temp: <span id="gpu-cpu-temp" class="green">--</span>&deg;C | GPU Temp: <span id="gpu-gpu-temp" class="green">--</span>&deg;C
+    </div>
+  </div>
+  <div class="card span2">
+    <div class="card-label">Optimization Hints</div>
+    <div class="hints" id="hints"></div>
+  </div>
+  <div class="card span2">
+    <div class="card-label">Cache <span id="cache-status" style="float:right;font-weight:400;text-transform:none;letter-spacing:0;color:var(--dim)"></span></div>
+    <div id="cache-panel">
+      <div style="display:flex;gap:20px;align-items:baseline">
+        <div><span class="card-value" id="cache-hit" style="font-size:1.5rem"><span class="dim">N/A</span></span><div class="card-sub">hit rate</div></div>
+        <div><span class="card-sm" id="cache-entries" style="color:var(--orange)">—</span><div class="card-sub">entries</div></div>
+      </div>
+      <div class="bar"><div class="bar-fill bg-green" id="cache-bar" style="width:0%"></div></div>
+    </div>
+  </div>
+
+  <!-- Row 5: Telemetry Charts (Power + Temperature) -->
+  <div class="card span3">
+    <div class="chart-wrap">
+      <div class="chart-label">Power (W)</div>
+      <div class="chart-value yellow" id="power-chart-val">0 W</div>
+      <canvas id="power-chart"></canvas>
+    </div>
+  </div>
+  <div class="card span3">
+    <div class="chart-wrap">
+      <div class="chart-label">Temperature (&deg;C)</div>
+      <div class="chart-value" id="temp-chart-val"><span class="green">-- &deg;C</span></div>
+      <canvas id="temp-chart"></canvas>
+    </div>
+  </div>
+
+  <!-- Row 6: Live Logs -->
+  <div class="card span6">
+    <div class="card-label">Live Logs <span style="float:right;font-weight:400;text-transform:none;letter-spacing:0">last 100 entries</span></div>
+    <div class="log-panel" id="log-panel"></div>
+  </div>
+
+  <!-- Row 7: API Endpoints -->
+  <div class="card span6">
+    <div class="card-label">API Endpoints</div>
+    <div style="display:flex;flex-wrap:wrap;gap:16px;font-size:0.82rem;line-height:1.8">
+      <div>
+        <strong style="color:var(--accent);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px">Core</strong><br>
+        <a href="/status" target="_blank" style="color:var(--text);text-decoration:none">/status</a>
+        <a href="/health" target="_blank" style="color:var(--text);text-decoration:none;margin-left:8px">/health</a>
+        <a href="/hints" target="_blank" style="color:var(--text);text-decoration:none;margin-left:8px">/hints</a>
+      </div>
+      <div>
+        <strong style="color:var(--accent);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px">Chat</strong><br>
+        <a href="/v1/chat/completions" target="_blank" style="color:var(--text);text-decoration:none">/v1/chat/completions</a>
+        <a href="/v1/models" target="_blank" style="color:var(--text);text-decoration:none;margin-left:8px">/v1/models</a>
+      </div>
+      <div>
+        <strong style="color:var(--accent);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px">Cache</strong><br>
+        <a href="/cache/stats" target="_blank" style="color:var(--text);text-decoration:none">/cache/stats</a>
+      </div>
+      <div>
+        <strong style="color:var(--accent);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px">Workers</strong><br>
+        <a href="/workers" target="_blank" style="color:var(--text);text-decoration:none">/workers</a>
+      </div>
+      <div>
+        <strong style="color:var(--accent);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px">Telemetry</strong><br>
+        <a href="/telemetry" target="_blank" style="color:var(--text);text-decoration:none">/telemetry</a>
+        <a href="/gpu" target="_blank" style="color:var(--text);text-decoration:none;margin-left:8px">/gpu</a>
+      </div>
+      <div>
+        <strong style="color:var(--accent);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px">Admin</strong><br>
+        <a href="/metrics" target="_blank" style="color:var(--text);text-decoration:none">/metrics</a>
+        <a href="/logs/recent" target="_blank" style="color:var(--text);text-decoration:none;margin-left:8px">/logs/recent</a>
+        <a href="/v1/config" target="_blank" style="color:var(--text);text-decoration:none;margin-left:8px">/v1/config</a>
+      </div>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<script>
+const MAX = 120;
+// Restore chart history from localStorage (survives page reload)
+let memH = [], tpsH = [], rpsH = [], powerH = [], cpuTempH = [], gpuTempH = [];
+try {
+  memH = JSON.parse(localStorage.getItem('mlx-dash-memH') || '[]');
+  tpsH = JSON.parse(localStorage.getItem('mlx-dash-tpsH') || '[]');
+  powerH = JSON.parse(localStorage.getItem('mlx-dash-powerH') || '[]');
+  cpuTempH = JSON.parse(localStorage.getItem('mlx-dash-cpuTempH') || '[]');
+  gpuTempH = JSON.parse(localStorage.getItem('mlx-dash-gpuTempH') || '[]');
+} catch(e) {}
+let lastTok = 0, lastReq = 0, lastT = Date.now();
+function saveCharts() {
+  try {
+    localStorage.setItem('mlx-dash-memH', JSON.stringify(memH.slice(-MAX)));
+    localStorage.setItem('mlx-dash-tpsH', JSON.stringify(tpsH.slice(-MAX)));
+    localStorage.setItem('mlx-dash-powerH', JSON.stringify(powerH.slice(-MAX)));
+    localStorage.setItem('mlx-dash-cpuTempH', JSON.stringify(cpuTempH.slice(-MAX)));
+    localStorage.setItem('mlx-dash-gpuTempH', JSON.stringify(gpuTempH.slice(-MAX)));
+  } catch(e) {}
+}
+
+function drawChart(canvas, data, color, gradAlpha) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const w = rect.width, h = rect.height;
+  ctx.clearRect(0, 0, w, h);
+  if (data.length < 2) return;
+  const max = Math.max(...data, 1) * 1.15;
+  const pts = data.map((v, i) => [i / (MAX - 1) * w, h - (v / max) * (h - 50) - 4]);
+  ctx.strokeStyle = 'rgba(92,106,122,0.12)'; ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) { const y = h * i / 4; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, color.replace(')', `,${gradAlpha})`).replace('rgb', 'rgba'));
+  grad.addColorStop(1, color.replace(')', ',0)').replace('rgb', 'rgba'));
+  ctx.beginPath(); ctx.moveTo(pts[0][0], h);
+  pts.forEach(p => ctx.lineTo(p[0], p[1]));
+  ctx.lineTo(pts[pts.length-1][0], h); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+  ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+  pts.forEach((p, i) => i === 0 ? ctx.moveTo(p[0], p[1]) : ctx.lineTo(p[0], p[1]));
+  ctx.stroke();
+  const last = pts[pts.length - 1];
+  ctx.beginPath(); ctx.arc(last[0], last[1], 4, 0, Math.PI * 2);
+  ctx.fillStyle = color; ctx.fill();
+}
+
+function drawMultiChart(canvas, datasets, maxVal) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const w = rect.width, h = rect.height;
+  ctx.clearRect(0, 0, w, h);
+  const max = maxVal || Math.max(...datasets.flatMap(d => d.data), 1) * 1.15;
+  // Grid lines
+  ctx.strokeStyle = 'rgba(92,106,122,0.12)'; ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) { const y = h * i / 4; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+  datasets.forEach(({data, color}) => {
+    if (data.length < 2) return;
+    const pts = data.map((v, i) => [i / (MAX - 1) * w, h - (v / max) * (h - 50) - 4]);
+    ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+    pts.forEach((p, i) => i === 0 ? ctx.moveTo(p[0], p[1]) : ctx.lineTo(p[0], p[1]));
+    ctx.stroke();
+    const last = pts[pts.length - 1];
+    ctx.beginPath(); ctx.arc(last[0], last[1], 3, 0, Math.PI * 2);
+    ctx.fillStyle = color; ctx.fill();
+  });
+}
+function tempColor(c) { return c > 85 ? 'red' : c > 70 ? 'yellow' : 'green'; }
+function pressureColor(pct) { return pct > 90 ? 'red' : pct > 70 ? 'yellow' : 'green'; }
+function pressureBg(pct) { return pct > 90 ? 'bg-red' : pct > 70 ? 'bg-yellow' : 'bg-green'; }
+function fmtTime(s) { const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = Math.floor(s%60); return h > 0 ? h+'h '+m+'m' : m > 0 ? m+'m '+sec+'s' : sec+'s'; }
+
+function renderHints(hints) {
+  const el = document.getElementById('hints');
+  if (!hints || hints.length === 0) {
+    el.innerHTML = '<div class="hint hint-info"><span class="hint-icon">&#10003;</span>All systems nominal</div>';
+    return;
+  }
+  el.innerHTML = hints.map(h => {
+    const cls = h.priority === 'critical' ? 'hint-critical' : h.priority === 'warning' ? 'hint-warning' : 'hint-info';
+    const icon = h.priority === 'critical' ? '&#9888;' : h.priority === 'warning' ? '&#9888;' : '&#8505;';
+    return '<div class="hint '+cls+'"><span class="hint-icon">'+icon+'</span><div>'+h.message+'</div></div>';
+  }).join('');
+}
+
+let workerPyStatus = {}; // port -> {model, tokens, uptime, pressure}
+
+function renderWorkers(wdata) {
+  const el = document.getElementById('workers');
+  if (!wdata || !wdata.workers) { el.innerHTML = '<div class="card-sub">No worker data</div>'; return; }
+  el.innerHTML = wdata.workers.map(w => {
+    const dotColor = w.healthy ? 'var(--green)' : 'var(--red)';
+    const py = workerPyStatus[w.port] || {};
+    const modelShort = py.model ? py.model.split('/').pop() : '—';
+    const pyTokens = py.tokens != null ? py.tokens.toLocaleString() : '—';
+    const pyUptime = py.uptime != null ? fmtTime(py.uptime) : '—';
+    const pyPressure = py.pressure || '—';
+    const pressureClass = pyPressure === 'critical' ? 'red' : pyPressure === 'warning' ? 'yellow' : 'dim';
+    return '<div class="worker-row" style="flex-wrap:wrap">'
+      + '<div class="worker-dot" style="background:'+dotColor+'"></div>'
+      + '<span style="font-weight:600">:'+w.port+'</span>'
+      + '<span style="color:var(--dim);font-size:0.75rem;margin-left:8px">'+modelShort+'</span>'
+      + '<span style="color:var(--dim);margin-left:auto;font-size:0.75rem">'+w.inflight+' inflight</span>'
+      + '<span style="color:var(--dim);margin-left:8px;font-size:0.75rem">'+w.total_requests+' routed</span>'
+      + '<span style="color:var(--dim);margin-left:8px;font-size:0.75rem">'+pyTokens+' tok</span>'
+      + '<span style="color:var(--'+pressureClass+');margin-left:8px;font-size:0.75rem">'+pyPressure+'</span>'
+      + '<button class="btn btn-sm" style="margin-left:8px" onclick="apiAction(\'/workers/restart\',\'POST\',{port:'+w.port+'})">restart</button>'
+      + '</div>';
+  }).join('');
+  document.getElementById('worker-summary').textContent = wdata.healthy_count + '/' + wdata.total_count + ' healthy';
+  // Show sessions and strategy
+  if (wdata.strategy) {
+    document.getElementById('worker-strategy').textContent = wdata.strategy;
+  }
+  if (wdata.sessions && wdata.sessions.length > 0) {
+    document.getElementById('sessions').textContent = wdata.sessions_active || wdata.sessions.length;
+    // Build per-worker session detail
+    const perWorker = {};
+    wdata.sessions.forEach(s => {
+      const port = s.worker_port || 'unknown';
+      if (!perWorker[port]) perWorker[port] = [];
+      perWorker[port].push(s.session_id ? s.session_id.substring(0,8) : '?');
+    });
+    const detailParts = Object.entries(perWorker).map(([port, ids]) =>
+      ':' + port + ' [' + ids.join(', ') + ']'
+    );
+    document.getElementById('worker-sessions-detail').innerHTML =
+      '<span style="color:var(--dim);font-size:0.72rem">Session pins: ' + detailParts.join(' | ') + '</span>';
+  } else {
+    document.getElementById('sessions').textContent = wdata.sessions_active || '0';
+    document.getElementById('worker-sessions-detail').innerHTML = '';
+  }
+}
+
+function renderMemBreakdown(mem) {
+  const el = document.getElementById('mem-breakdown');
+  const total = mem.total_gb || 1;
+  const pct = v => ((v||0) / total * 100).toFixed(1);
+  el.innerHTML = [
+    {v: mem.active_gb, c: 'var(--red)', l: 'Active '+pct(mem.active_gb)+'%'},
+    {v: mem.wired_gb, c: 'var(--orange)', l: 'Wired '+pct(mem.wired_gb)+'%'},
+    {v: mem.compressed_gb, c: 'var(--yellow)', l: 'Compressed '+pct(mem.compressed_gb)+'%'},
+    {v: mem.inactive_gb, c: 'var(--dim)', l: 'Inactive '+pct(mem.inactive_gb)+'%'},
+    {v: mem.free_gb, c: 'var(--green)', l: 'Free '+pct(mem.free_gb)+'%'},
+  ].map(s => '<div class="mem-seg" style="width:'+pct(s.v)+'%;background:'+s.c+'" data-label="'+s.l+'"></div>').join('');
+  document.getElementById('mem-detail').textContent =
+    'Active: '+(mem.active_gb||0).toFixed(1)+'G | Wired: '+(mem.wired_gb||0).toFixed(1)+'G | Compressed: '+(mem.compressed_gb||0).toFixed(1)+'G | Inactive: '+(mem.inactive_gb||0).toFixed(1)+'G | Free: '+(mem.free_gb||0).toFixed(1)+'G';
+}
+
+function renderLogs(logs) {
+  const el = document.getElementById('log-panel');
+  if (!logs || logs.length === 0) { el.innerHTML = '<div class="log-line" style="color:var(--dim)">No logs yet</div>'; return; }
+  const wasAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
+  el.innerHTML = logs.reverse().map(l => {
+    const cls = l.level === 'error' ? 'log-error' : l.level === 'warn' || l.level === 'warning' ? 'log-warn' : l.level === 'debug' ? 'log-debug' : 'log-info';
+    const ts = l.timestamp || '';
+    return '<div class="log-line"><span class="'+cls+'">['+l.level.toUpperCase().padEnd(5)+']</span> <span style="color:var(--dim)">'+l.component+'</span> '+l.message+'</div>';
+  }).join('');
+  if (wasAtBottom) el.scrollTop = el.scrollHeight;
+}
+
+async function apiAction(url, method, body) {
+  try {
+    const opts = {method};
+    if (body) { opts.headers = {'Content-Type':'application/json'}; opts.body = JSON.stringify(body); }
+    const r = await fetch(url, opts);
+    const j = await r.json();
+    const msg = j.message || JSON.stringify(j);
+    // Flash a brief status in the uptime area
+    const el = document.getElementById('uptime');
+    const prev = el.textContent;
+    el.textContent = msg.substring(0, 40);
+    el.style.color = 'var(--green)';
+    setTimeout(() => { el.style.color = ''; }, 3000);
+  } catch(e) { console.error('API action failed:', e); }
+}
+
+async function fetchWorkerPyStatus(ports) {
+  for (const port of ports) {
+    try {
+      const st = await fetch('http://127.0.0.1:'+port+'/status').then(r=>r.json());
+      workerPyStatus[port] = {
+        model: st.model || '',
+        tokens: (st.stats||{}).tokens_generated || 0,
+        requests: (st.stats||{}).requests || 0,
+        uptime: (st.stats||{}).uptime_s || 0,
+        pressure: (st.memory||{}).pressure || 'unknown',
+        memory_available_gb: (st.memory||{}).available_gb || 0,
+      };
+    } catch(e) { workerPyStatus[port] = {model:'unreachable', pressure:'unknown'}; }
+  }
+}
+
+async function poll() {
+  try {
+    const [st, cache, workers, logs, gpu, telem] = await Promise.all([
+      fetch('/status').then(r=>r.json()),
+      fetch('/cache/stats').then(r=>r.json()).catch(()=>null),
+      fetch('/workers').then(r=>r.json()).catch(()=>null),
+      fetch('/logs/recent').then(r=>r.json()).catch(()=>null),
+      fetch('/gpu').then(r=>r.json()).catch(()=>null),
+      fetch('/telemetry/current').then(r=>r.json()).catch(()=>null),
+    ]);
+    const mem = st.memory || {}, stats = st.stats || {};
+
+    // Model
+    const mname = st.model || 'none';
+    document.getElementById('model').textContent = mname.split('/').pop();
+    document.getElementById('model-sub').textContent = mname;
+
+    // Memory
+    const avail = Math.max((mem.free_gb||0) + (mem.inactive_gb||0) * 0.5, 0);
+    const total = mem.total_gb || 1;
+    const pct = ((1 - avail / total) * 100);
+    const pc = pressureColor(pct);
+    document.getElementById('mem-pct').innerHTML = '<span class="'+pc+'">'+pct.toFixed(0)+'%</span>';
+    document.getElementById('mem-bar').style.width = pct+'%';
+    document.getElementById('mem-bar').className = 'bar-fill '+pressureBg(pct);
+    document.getElementById('mem-avail').textContent = avail.toFixed(1);
+    document.getElementById('mem-total').textContent = total.toFixed(0);
+    document.getElementById('mem-chart-val').innerHTML = '<span class="'+pc+'">'+pct.toFixed(0)+'%</span>';
+
+    // Pressure + Swap
+    const pressure = (mem.pressure||'Normal').toString();
+    const pClass = pressure === 'Critical' ? 'red' : pressure === 'Warning' ? 'yellow' : 'green';
+    document.getElementById('pressure').innerHTML = '<span class="'+pClass+'">'+pressure+'</span>';
+    document.getElementById('swap').textContent = (mem.swap_used_gb||0).toFixed(1);
+
+    // Requests + Tokens + Rates
+    // Use max of Rust counter and Python worker aggregated (handles both old and new requests)
+    const rustTok = stats.tokens_generated || 0;
+    const pyTok = Object.values(workerPyStatus).reduce((sum, w) => sum + (w.tokens || 0), 0);
+    let tok = Math.max(rustTok, pyTok);
+    const req = stats.requests || 0;
+    const now = Date.now(), dt = (now - lastT) / 1000;
+    const tps = dt > 0 ? Math.max((tok - lastTok) / dt, 0) : 0;
+    const rps = dt > 0 ? Math.max((req - lastReq) / dt, 0) : 0;
+    lastTok = tok; lastReq = req; lastT = now;
+    document.getElementById('tokens').innerHTML = '<span class="accent">'+tok.toLocaleString()+'</span>';
+    document.getElementById('requests').textContent = req.toLocaleString();
+    document.getElementById('tok-rate').textContent = tps > 0 ? tps.toFixed(1) : '0';
+    // Savings vs Claude Sonnet ($15/1M tokens)
+    const savedDollars = tok / 1000000 * 15.0;
+    document.getElementById('savings').innerHTML = '<span class="green">$' + (savedDollars < 0.01 ? '0.00' : savedDollars.toFixed(2)) + '</span>';
+    document.getElementById('req-rate').textContent = rps > 0 ? rps.toFixed(2) : '0';
+    document.getElementById('tps-chart-val').textContent = tps > 0 ? tps.toFixed(1) : '0';
+    document.getElementById('uptime').textContent = fmtTime(stats.uptime_secs||0);
+
+    // Cache
+    if (cache && !cache.error) {
+      document.getElementById('cache-status').textContent = 'active';
+      document.getElementById('cache-status').style.color = 'var(--green)';
+      const hits = (cache.hot_hits||0)+(cache.warm_hits||0);
+      const t = hits+(cache.cold_hits||0);
+      const hr = t > 0 ? hits/t*100 : 0;
+      document.getElementById('cache-hit').innerHTML = '<span class="green">'+hr.toFixed(0)+'%</span>';
+      document.getElementById('cache-bar').style.width = hr+'%';
+      document.getElementById('cache-entries').textContent = (cache.cached_experts||0);
+    } else if (cache && cache.capacity_bytes > 0 && cache.entries === 0) {
+      // Cache allocated but empty — standard mlx_lm inference doesn't use the Rust expert cache
+      document.getElementById('cache-status').textContent = 'allocated (standard inference mode)';
+      document.getElementById('cache-status').style.color = 'var(--dim)';
+      document.getElementById('cache-hit').innerHTML = '<span class="dim">0%</span>';
+      document.getElementById('cache-entries').textContent = '0';
+      // Show capacity info
+      const capMb = Math.round(cache.capacity_bytes / (1024*1024));
+      document.getElementById('cache-bar').parentElement.nextElementSibling?.remove();
+    } else {
+      document.getElementById('cache-status').textContent = 'not enabled';
+      document.getElementById('cache-status').style.color = 'var(--dim)';
+      document.getElementById('cache-hit').innerHTML = '<span class="dim">N/A</span>';
+      document.getElementById('cache-entries').textContent = '—';
+    }
+
+    // Hints
+    renderHints(st.optimization_hints);
+
+    // Workers — fetch Python status for each, then render
+    const wdata = workers || st.workers;
+    if (wdata && wdata.workers) {
+      const ports = wdata.workers.map(w => w.port);
+      await fetchWorkerPyStatus(ports);
+    }
+    renderWorkers(wdata);
+
+    // Memory breakdown
+    renderMemBreakdown(mem);
+
+    // Logs
+    if (logs && logs.logs) renderLogs(logs.logs);
+
+    // GPU
+    if (gpu && !gpu.error) {
+      const gUtil = gpu.device_utilization_pct || 0;
+      document.getElementById('gpu-util').innerHTML = '<span class="accent">'+gUtil+'%</span>';
+      document.getElementById('gpu-bar').style.width = gUtil+'%';
+      document.getElementById('gpu-mem').textContent = (gpu.gpu_memory_used_gb||0).toFixed(1);
+      document.getElementById('gpu-renderer').textContent = gpu.renderer_utilization_pct || 0;
+      document.getElementById('gpu-tiler').textContent = gpu.tiler_utilization_pct || 0;
+    }
+
+    // Telemetry (power, thermal, ANE)
+    let curPower = 0, curCpuTemp = 0, curGpuTemp = 0, curAne = 0;
+    if (telem && !telem.error) {
+      curPower = telem.power_watts || 0;
+      curCpuTemp = telem.cpu_temp_c || 0;
+      curGpuTemp = telem.gpu_temp_c || 0;
+      curAne = telem.ane_util_pct || 0;
+      document.getElementById('gpu-power').textContent = curPower.toFixed(1);
+      document.getElementById('gpu-ane').textContent = curAne.toFixed(0) + '%';
+      // Color-code temperature inline in the GPU card
+      const cpuTempEl = document.getElementById('gpu-cpu-temp');
+      const gpuTempEl = document.getElementById('gpu-gpu-temp');
+      cpuTempEl.textContent = curCpuTemp.toFixed(0);
+      gpuTempEl.textContent = curGpuTemp.toFixed(0);
+      cpuTempEl.className = tempColor(curCpuTemp);
+      gpuTempEl.className = tempColor(curGpuTemp);
+      // Color-code temperature display in chart
+      const maxTemp = Math.max(curCpuTemp, curGpuTemp);
+      const tc = tempColor(maxTemp);
+      document.getElementById('temp-chart-val').innerHTML = '<span class="'+tc+'">CPU '+curCpuTemp.toFixed(0)+'&deg; / GPU '+curGpuTemp.toFixed(0)+'&deg;C</span>';
+      document.getElementById('power-chart-val').textContent = curPower.toFixed(1) + ' W';
+    }
+
+    // Charts
+    memH.push(pct); if (memH.length > MAX) memH.shift();
+    tpsH.push(tps); if (tpsH.length > MAX) tpsH.shift();
+    powerH.push(curPower); if (powerH.length > MAX) powerH.shift();
+    cpuTempH.push(curCpuTemp); if (cpuTempH.length > MAX) cpuTempH.shift();
+    gpuTempH.push(curGpuTemp); if (gpuTempH.length > MAX) gpuTempH.shift();
+    drawChart(document.getElementById('mem-chart'), memH, 'rgb(77,166,255)', 0.15);
+    drawChart(document.getElementById('tps-chart'), tpsH, 'rgb(45,212,168)', 0.15);
+    drawChart(document.getElementById('power-chart'), powerH, 'rgb(251,191,36)', 0.15);
+    drawMultiChart(document.getElementById('temp-chart'), [
+      {data: cpuTempH, color: 'rgb(249,115,22)'},
+      {data: gpuTempH, color: 'rgb(239,68,68)'},
+    ], 110);
+    saveCharts();
+  } catch(e) {}
+}
+
+poll(); setInterval(poll, 2000);
+</script>
+</body>
+</html>
+"##;
