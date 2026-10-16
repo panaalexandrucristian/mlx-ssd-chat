@@ -5,7 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import subprocess
+
+from scripts.source_inventory import inventory, revision
 
 ROOT = Path(__file__).resolve().parent
 
@@ -14,16 +15,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "dist/mlx-ssd-setup.md")
     args = parser.parse_args()
-    entries = subprocess.check_output(["git", "ls-files", "--stage", "-z"], cwd=ROOT).decode().split("\0")
     files = {}
-    for entry in filter(None, entries):
-        metadata, name = entry.split("\t", 1)
-        mode = metadata.split()[0]
-        files[name] = ((ROOT / name).read_bytes(), 0o755 if mode == "100755" else 0o644)
-    files["EXPORT-REVISION.txt"] = (subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT), 0o644)
+    for name, record in inventory(ROOT).items():
+        files[name] = ((ROOT / name).read_bytes(), record["mode"])
+    files["EXPORT-REVISION.txt"] = ((revision(ROOT) + "\n").encode(), 0o644)
     for folder in (ROOT / "artifacts", ROOT / "test-logs"):
         if folder.exists():
             for path in sorted(folder.rglob("*")):
+                if "sources" in path.relative_to(folder).parts:
+                    continue
                 if path.is_file() and path.suffix in (".json", ".log"):
                     files[str(path.relative_to(ROOT))] = (path.read_bytes(), 0o644)
     manifest = {}

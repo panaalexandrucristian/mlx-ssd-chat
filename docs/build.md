@@ -39,7 +39,8 @@ MLX nu este tratat ca defect; nu există un fix nativ justificat de probele ini�
 
 1. Verifică platforma și disponibilitatea compilatorului Metal.
 2. Creează `.build-venv` cu Python 3.12.13 și cele 8 pachete din lock-ul de build.
-3. Construiește MLX-Flash din copia versionată și verifică hash-ul patch-ului.
+3. Copiază intrările MLX-Flash versionate într-un director unic per build,
+   refuză modificări necomise în pachet și verifică hash-ul patch-ului.
 4. Clonează/verifică checkout-ul MLX fixat și curat.
 5. Construiește frontend-ul cu `MLX_BUILD_FRONTEND_PACKAGE=1`, apoi backend-ul
    cu `MLX_BUILD_BACKEND_PACKAGE=1`. În ambele cazuri: `PYPI_RELEASE=1`,
@@ -50,6 +51,9 @@ MLX nu este tratat ca defect; nu există un fix nativ justificat de probele ini�
 
 Toolchain-ul efectiv, opțiunile, commiturile, logul și hash-urile wheel-urilor sunt
 în `artifacts/native*.json`, `artifacts/logs/` și directoarele wheel-urilor.
+Fiecare build păstrează propriul manifest și wheel-uri în `artifacts/builds/`;
+rebuild-ul unui profil nu suprascrie artefactele altui profil sau build anterior.
+Manifestul include SHA-256 pentru toate intrările din sursa MLX-Flash.
 Sursa exactă este fixată; SDK-ul și compilatorul sunt înregistrate, nu instalate
 automat. Folosește aceleași versiuni pentru a reproduce configurația măsurată.
 Un build cu alt SDK poate produce alte hash-uri și necesită validare proprie.

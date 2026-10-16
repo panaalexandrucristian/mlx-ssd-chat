@@ -18,7 +18,7 @@ def main():
         parser.error("Use a lowercase, filesystem-safe label")
     logs = ROOT / "artifacts/validation" / args.label
     logs.mkdir(parents=True, exist_ok=True)
-    commands = [("regression", ["-m", "unittest", "-v", "test_cli", "test_reader", "test_streaming"], 120)]
+    commands = [("regression", ["-m", "unittest", "-v", "test_cli", "test_reader", "test_streaming", "test_export", "test_sources"], 120)]
     if args.real_model:
         commands.extend([
             ("smoke", ["ai.py", "--no-thinking", "--max-tokens", "16", "--seed", "42",

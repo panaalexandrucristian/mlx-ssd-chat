@@ -62,7 +62,10 @@ Sursa MLX se clonează în `.sources/mlx`, branch `local/exact-ssd`.
 Sursa MLX-Flash se construiește din `vendor/mlx-flash`.
 
 Artefactele, SHA-256, toolchain-ul, comenzile complete și logurile se păstrează
-în `artifacts/`. `scripts/verify_runtime.py` compară fișierele instalate cu
+în directoare unice per build sub `artifacts/builds/`, cu loguri în `artifacts/logs/`.
+Sursele MLX-Flash trebuie comise înainte de build; o copie curată numai a fișierelor
+versionate este folosită ca intrare, cu hash pentru fiecare fișier.
+`scripts/verify_runtime.py` compară fișierele instalate cu
 wheel-urile locale, execută o operație GPU și verifică biblioteca MLX încărcată.
 Build-ul refuză un checkout MLX modificat sau un compilator Metal absent.
 
@@ -140,6 +143,8 @@ patch-urile, lock-urile, documentația și dovezile build/test disponibile.
 Fișierele binare upstream sunt codificate base64. Restaurarea verifică inventarul
 și hash-urile înainte de scriere. Wheel-urile se reconstruiesc, modelul se descarcă.
 Pentru regenerarea exportului după modificări, adaugă fișierele noi în Git.
+O restaurare fără Git poate regenera exportul folosind inventarul păstrat în
+`EXPORT-MANIFEST.json`; fișierele deja inventariate sunt recitite de pe disc.
 
 ## Originea surselor
 

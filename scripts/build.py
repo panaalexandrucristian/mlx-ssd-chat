@@ -10,6 +10,8 @@ import subprocess
 import sys
 import time
 
+from source_inventory import revision, snapshot_flash
+
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = json.loads((ROOT / "upstream.lock.json").read_text())
 UV = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
@@ -48,11 +50,15 @@ def environment(path, requirements):
     python = path / "bin/python"
     if not python.exists():
         run([UV, "venv", "--python", LOCK["python"], path])
-    version = subprocess.check_output([str(python), "-c", "import platform; print(platform.python_version())"], text=True).strip()
-    if version != LOCK["python"]:
-        raise RuntimeError(f"Expected Python {LOCK['python']}, found {version} in {path}")
+    check_python(python)
     run([UV, "pip", "sync", "--link-mode", "copy", "--python", python, requirements])
     return python
+
+
+def check_python(python):
+    version = subprocess.check_output([str(python), "-c", "import platform; print(platform.python_version())"], text=True).strip()
+    if version != LOCK["python"]:
+        raise RuntimeError(f"Expected Python {LOCK['python']}, found {version} in {python.parent.parent}")
 
 
 def clone_mlx():
@@ -85,24 +91,22 @@ def build_wheel(source, destination, env):
     return wheels[0]
 
 
-def build_flash(env):
-    source = ROOT / "vendor/mlx-flash"
+def build_flash(env, directory):
+    source = directory / "sources/mlx-flash"
+    hashes = snapshot_flash(ROOT, source)
     expected = ROOT / "reference/expert_streaming.py"
     if sha256(source / "mlx_flash_compress/expert_streaming.py") != sha256(expected):
         raise RuntimeError("Vendored streaming implementation differs from the verified patch")
-    return build_wheel(source, ARTIFACTS / "flash", env)
+    return build_wheel(source, directory / "flash", env), hashes
 
 
-def write_manifest(name, wheels, details):
+def write_manifest(name, wheels, details, directory):
     assert BUILD_LOG is not None
-    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True)
-    project_commit = (revision.stdout.strip() if revision.returncode == 0
-                      else (ROOT / "EXPORT-REVISION.txt").read_text().strip())
     data = {
         "profile": name,
         "build_log": str(BUILD_LOG.relative_to(ROOT)),
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "project_commit": project_commit,
+        "project_commit": revision(ROOT),
         "upstream": LOCK,
         "runtime_requirements_sha256": sha256(ROOT / "requirements/runtime.txt"),
         "build_requirements_sha256": sha256(ROOT / "requirements/build.txt"),
@@ -110,7 +114,9 @@ def write_manifest(name, wheels, details):
         "wheels": [{"path": str(p.relative_to(ROOT)), "sha256": sha256(p)} for p in wheels],
         **details,
     }
-    (ARTIFACTS / f"{name}.json").write_text(json.dumps(data, indent=2) + "\n")
+    content = json.dumps(data, indent=2) + "\n"
+    (ARTIFACTS / f"{name}.json").write_text(content)
+    (directory / "manifest.json").write_text(content)
 
 
 def install(name, wheels):
@@ -118,6 +124,7 @@ def install(name, wheels):
     python = path / "bin/python"
     if not python.exists():
         run([UV, "venv", "--python", LOCK["python"], path])
+    check_python(python)
     # Replacing lock entries with wheel paths prevents resolving local packages
     # back to the index while preserving all other exact runtime pins.
     packages = {wheel.name.split("-", 1)[0].replace("_", "-") for wheel in wheels}
@@ -169,8 +176,10 @@ def main():
             (ARTIFACTS / "native-blocker.json").write_text(json.dumps(metal, indent=2) + "\n")
             raise RuntimeError("Metal compiler unavailable. Select a full Xcode installation using DEVELOPER_DIR or xcode-select.")
     env = build_environment()
-    wheels = [build_flash(env)]
-    details = {}
+    directory = ARTIFACTS / "builds" / f"{args.profile}-{time.time_ns()}"
+    wheel, hashes = build_flash(env, directory)
+    wheels = [wheel]
+    details: dict[str, object] = {"flash_source_sha256": hashes}
     if args.profile == "native":
         source = clone_mlx()
         deployment = ".".join(platform.mac_ver()[0].split(".")[:2])
@@ -189,13 +198,13 @@ def main():
             ["xcrun", "--sdk", "macosx", "metal", "--version"],
             ["clang", "--version"], [str(BUILD_PYTHON.parent / "cmake"), "--version"],
         ]]
-        details = {"build_options": options, "toolchain": toolchain, "native_source_modified": False}
+        details.update({"build_options": options, "toolchain": toolchain, "native_source_modified": False})
         (ARTIFACTS / "native-toolchain.json").write_text(json.dumps(details, indent=2) + "\n")
         for package in ("frontend", "backend"):
             package_env = {**env, "MLX_BUILD_FRONTEND_PACKAGE": str(int(package == "frontend")),
                            "MLX_BUILD_BACKEND_PACKAGE": str(int(package == "backend"))}
-            wheels.append(build_wheel(source, ARTIFACTS / package, package_env))
-    write_manifest(args.profile, wheels, details)
+            wheels.append(build_wheel(source, directory / package, package_env))
+    write_manifest(args.profile, wheels, details, directory)
     install(args.profile, wheels)
     print(f"Built and verified {args.profile}; artifacts in {ARTIFACTS}")
 

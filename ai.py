@@ -1,5 +1,7 @@
 """On-demand terminal chat: Qwen3-MoE, exact SSD streaming, configurable memory."""
 import argparse
+import json
+from pathlib import Path
 import sys
 import time
 from typing import Any, cast
@@ -7,8 +9,9 @@ from typing import Any, cast
 from memory_guard import add_memory_arguments, process_memory_limit
 from runtime import guarded_process
 
-MODEL = "mlx-community/Josiefied-Qwen3-30B-A3B-abliterated-v2-4bit"
-REVISION = "f7dbd27ebbaf60abd0c15111cfde8112ee9b1d1e"
+_MODEL_PIN = json.loads(Path(__file__).with_name("upstream.lock.json").read_text())["model"]
+MODEL = _MODEL_PIN["id"]
+REVISION = _MODEL_PIN["revision"]
 
 
 def common_prefix(a, b):

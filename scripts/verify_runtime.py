@@ -4,6 +4,7 @@ import ctypes
 import hashlib
 import importlib.metadata
 import json
+import platform
 from pathlib import Path
 import sys
 import sysconfig
@@ -21,6 +22,8 @@ def verify(profile):
     import mlx_flash_compress.expert_streaming as streaming
 
     manifest = json.loads((ROOT / f"artifacts/{profile}.json").read_text())
+    if platform.python_version() != manifest["upstream"]["python"]:
+        raise RuntimeError("Runtime Python version differs from the pinned version")
     site = Path(sysconfig.get_paths()["purelib"])
     if digest(Path(streaming.__file__).read_bytes()) != manifest["streaming_sha256"]:
         raise RuntimeError("Installed streaming module does not match the build")

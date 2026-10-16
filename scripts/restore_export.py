@@ -8,8 +8,9 @@ import re
 
 
 def restore(document, destination):
+    destination = destination.resolve()
     pattern = r"^### File: `([^`]+)`\n\n(?P<fence>`{4,})(utf-8|base64)\n(.*?)\n(?P=fence)$"
-    blocks = list(re.finditer(pattern, document.read_text(), re.MULTILINE | re.DOTALL))
+    blocks = list(re.finditer(pattern, document.read_bytes().decode("utf-8"), re.MULTILINE | re.DOTALL))
     files = {}
     encodings = {}
     for block in blocks:
@@ -21,7 +22,8 @@ def restore(document, destination):
             raise ValueError(f"Duplicate file: {name}")
         files[name] = base64.b64decode(content.strip(), validate=True) if encoding == "base64" else content.encode()
         encodings[name] = encoding
-    manifest = json.loads(files.pop("EXPORT-MANIFEST.json"))
+    manifest_bytes = files.pop("EXPORT-MANIFEST.json")
+    manifest = json.loads(manifest_bytes)
     if set(files) != set(manifest):
         raise ValueError("Incomplete export inventory")
     for name, data in files.items():
@@ -29,6 +31,9 @@ def restore(document, destination):
             raise ValueError(f"Checksum mismatch: {name}")
         if manifest[name]["mode"] not in (0o644, 0o755):
             raise ValueError(f"Invalid file mode: {name}")
+    # Persist the source inventory so standalone restores can export again.
+    files["EXPORT-MANIFEST.json"] = manifest_bytes
+    for name, data in files.items():
         target = destination / name
         if any(p.is_symlink() for p in (target, *target.parents)):
             raise ValueError(f"Symlink in destination: {name}")
@@ -38,7 +43,7 @@ def restore(document, destination):
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-        target.chmod(manifest[name]["mode"])
+        target.chmod(manifest[name]["mode"] if name in manifest else 0o644)
     print(f"Verified and restored {len(files)} files to {destination}")
 
 
