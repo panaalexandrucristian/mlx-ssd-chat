@@ -6,6 +6,7 @@ import pty
 import re
 import select
 import subprocess
+import sys
 import time
 
 
@@ -13,7 +14,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--thinking", action="store_true")
     args = parser.parse_args()
-    command = [str(Path.home() / ".local/bin/ai"), "--max-tokens", "512" if args.thinking else "64"]
+    command = [sys.executable, str(Path(__file__).with_name("ai.py")), "--seed", "42",
+               "--max-tokens", "512" if args.thinking else "64"]
     if not args.thinking:
         command.append("--no-thinking")
     master, slave = pty.openpty()

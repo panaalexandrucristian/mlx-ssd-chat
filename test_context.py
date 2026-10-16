@@ -2,6 +2,7 @@
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
@@ -41,7 +42,8 @@ def main():
     assert len(tokens(lines[1])) + 16 <= 4096
     print(f"Actual one-line prompt: {len(tokens(lines[1]))} tokens", flush=True)
     result = subprocess.run(
-        [str(Path.home() / ".local/bin/ai"), "--no-thinking", "--max-tokens", "16"],
+        [sys.executable, str(Path(__file__).with_name("ai.py")), "--seed", "42",
+         "--no-thinking", "--max-tokens", "16"],
         input="\n".join(lines) + "\n", text=True, capture_output=True, timeout=900)
     output = result.stdout + "\n" + result.stderr
     logs = Path(__file__).resolve().parent / "test-logs"

@@ -1,6 +1,8 @@
 """Size the resident Qwen3 expert cache from the MLX budget, before evaluation."""
 from dataclasses import dataclass
+from typing import Any, cast
 
+import mlx.core as mx
 from mlx.utils import tree_flatten
 
 
@@ -11,6 +13,7 @@ class ExpertCachePlan:
     fixed_bytes: int
     bytes_per_slot: int
     reserve_bytes: int
+    top_k: int
 
     @property
     def resident_bytes(self):
@@ -22,7 +25,11 @@ class ExpertCachePlan:
                 f"MLX working reserve {self.reserve_bytes/1e9:.2f} GB")
 
 
-def plan_expert_cache(model, memory_limit):
+def parameter_arrays(model):
+    return cast(list[tuple[str, mx.array]], tree_flatten(model.parameters()))
+
+
+def plan_expert_cache(model: Any, memory_limit: int) -> ExpertCachePlan:
     """Inspect lazy parameter sizes without loading the full expert weights.
 
     Keep 10% (at least 400 MB) for KV, prefill and temporary arrays. This is a
@@ -31,7 +38,7 @@ def plan_expert_cache(model, memory_limit):
     if getattr(model, "model_type", None) != "qwen3_moe":
         raise ValueError("Automatic expert cache sizing supports qwen3_moe only")
 
-    total_bytes = sum(array.nbytes for _, array in tree_flatten(model.parameters()))
+    total_bytes = sum(array.nbytes for _, array in parameter_arrays(model))
     expert_bytes = 0
     bytes_per_slot = 0
     num_experts = None
@@ -46,13 +53,13 @@ def plan_expert_cache(model, memory_limit):
             raise ValueError("Automatic cache sizing requires uniform expert counts")
         num_experts = count
         top_k = max(top_k, mlp.top_k)
-        for _, array in tree_flatten(switch.parameters()):
+        for _, array in parameter_arrays(switch):
             if array.shape[0] != count or array.nbytes % count:
                 raise ValueError("Unsupported expert parameter layout for cache sizing")
             expert_bytes += array.nbytes
             bytes_per_slot += array.nbytes // count
 
-    if not bytes_per_slot:
+    if not bytes_per_slot or num_experts is None:
         raise ValueError("Cannot find expert weights for automatic cache sizing")
     fixed_bytes = total_bytes - expert_bytes
     reserve_bytes = max(400_000_000, memory_limit // 10)
@@ -63,4 +70,4 @@ def plan_expert_cache(model, memory_limit):
             f"MLX budget too small for exact streaming: need at least {top_k} "
             f"experts per layer and working memory (~{required/1e9:.2f} GB). "
             "Increase --mlx-memory-gb.")
-    return ExpertCachePlan(capacity, num_experts, fixed_bytes, bytes_per_slot, reserve_bytes)
+    return ExpertCachePlan(capacity, num_experts, fixed_bytes, bytes_per_slot, reserve_bytes, top_k)

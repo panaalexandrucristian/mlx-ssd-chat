@@ -1,0 +1,18 @@
+{
+  "python": "3.12.13",
+  "mlx": {
+    "url": "https://github.com/ml-explore/mlx.git",
+    "tag": "v0.32.4",
+    "commit": "36969c094354086e15d2a327a9c50feb20b9cf11"
+  },
+  "mlx-flash": {
+    "url": "https://github.com/szibis/MLX-Flash.git",
+    "tag": "v0.9.2",
+    "commit": "c3561916ae2e4fbfd2278483d8be570b4cce70f7",
+    "upstream_streaming_sha256": "bbb63eb183984d17ccf06721eb0c0bb02a2aa17699241199e70fa2fd4b123680"
+  },
+  "model": {
+    "id": "mlx-community/Josiefied-Qwen3-30B-A3B-abliterated-v2-4bit",
+    "revision": "f7dbd27ebbaf60abd0c15111cfde8112ee9b1d1e"
+  }
+}

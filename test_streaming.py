@@ -28,6 +28,7 @@ class StreamingRegression(unittest.TestCase):
         reference.set_dtype(mx.bfloat16)
         nn.quantize(reference, group_size=32, bits=4)
         mx.eval(reference.parameters())
+        mx.synchronize()
         before = mx.get_active_memory()
         plans = [plan_expert_cache(reference, budget)
                  for budget in (400_130_000, 400_230_000, 1_000_000_000)]

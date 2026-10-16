@@ -30,6 +30,8 @@ def process_memory_limit(args, parser):
     limit = args.process_memory_bytes
     if limit is None:
         limit = args.mlx_memory_bytes + 1_200_000_000
+    if limit >= 2**64:
+        parser.error("process memory budget must fit in 64-bit bytes")
     if limit <= args.mlx_memory_bytes:
         parser.error("--process-memory-gb must be greater than --mlx-memory-gb")
     return limit

@@ -1,0 +1,8 @@
+#!/bin/zsh
+ROOT=${0:A:h:h}
+PYTHON=${MLX_SSD_PYTHON:-"$ROOT/.venv/bin/python"}
+if [[ ! -x "$PYTHON" ]]; then
+  print -u2 'Build the runtime first: python3 scripts/build.py native'
+  exit 1
+fi
+exec "$PYTHON" "$ROOT/ai.py" "$@"

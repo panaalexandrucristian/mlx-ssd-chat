@@ -1,0 +1,6 @@
+build==1.6.1
+cmake==4.4.4
+ninja==1.13.2
+setuptools==84.0.0
+wheel==0.48.0
+typing-extensions==4.16.0
